@@ -10,6 +10,7 @@ pub const Shutdown = struct {
         var mask = p.sigemptyset();
         p.sigaddset(&mask, p.SIG.INT);
         p.sigaddset(&mask, p.SIG.TERM);
+        p.sigaddset(&mask, p.SIG.HUP);
         var previous: p.sigset_t = undefined;
         p.sigprocmask(p.SIG.BLOCK, &mask, &previous);
         errdefer p.sigprocmask(p.SIG.SETMASK, &previous, null);
@@ -17,7 +18,10 @@ pub const Shutdown = struct {
     }
     pub fn deinit(self: *Shutdown) void {
         p.close(self.fd);
-        p.sigprocmask(p.SIG.SETMASK, &self.previous, null);
+        // This executable exits after a requested shutdown. Keep these signals
+        // blocked through final context cleanup: pending HUP/TERM must not turn
+        // an orderly return into default-signal termination during teardown.
+        if (self.state == .running) p.sigprocmask(p.SIG.SETMASK, &self.previous, null);
     }
     pub fn signal(self: *Shutdown, now: u64, grace: u16) void {
         if (self.state == .running) {

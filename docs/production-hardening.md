@@ -10,7 +10,7 @@ SIGINT and SIGTERM are blocked and consumed through a nonblocking CLOEXEC Linux 
 
 A second delivered termination signal forces closure, as does expiry of `--shutdown-ms`. Standard Linux signals can coalesce: two identical signals sent before either is consumed can appear as one. After observing `shutdown_begin`, another signal predictably forces shutdown. Scans and epoll waits bound scheduler granularity to about 50 ms, excluding OS scheduling delays. Grace is an upper bound, not an extension of existing request/upstream deadlines.
 
-The event loop takes ownership of the listener even on initialization failure. Deferred cleanup releases linked upstreams before clients, frees both slot pools, closes epoll and signalfd, and restores the previous signal mask. Closing the listener during draining is tracked separately to prevent double close. Slot generation tokens reject stale epoll events.
+The event loop takes ownership of the listener even on initialization failure. Deferred cleanup releases linked upstreams before clients, frees both slot pools, closes epoll and signalfd, and restores the previous signal mask on error unwinding. Phase 5A retains blocked termination/reload signals during requested termination until process exit. Closing the listener during draining is tracked separately to prevent double close. Slot generation tokens reject stale epoll events.
 
 ## CLI additions
 
@@ -84,3 +84,13 @@ See [validation record](phase4a-validation.md) for measured results and the chan
 ## Phase 4B
 
 Design TLS transport ownership around the existing connection lifecycle; define nonblocking handshake/read/write states, handshake deadlines and memory limits. Choose a maintained TLS provider and certificate-loading/reload policy, test error paths and partial TLS IO, and extend graceful drain to TLS close notifications. Keep certificate secrets out of logs. HTTPS forwarding metadata must be derived from the actual transport. ACME, HTTP/2 and HTTP/3 need separate scoped designs and validation.
+
+## Phase 5A TLS reliability additions
+
+HTTPS now admits at most 128 unfinished handshakes by default (`--max-tls-handshakes`, range 1–32768), while preserving the global client limit. `--tls-handshake-timeout-ms` aliases the existing `--tls-handshake-ms`. A Session owns each permit until handshake success or cleanup; no counter decrement is tied solely to epoll readiness.
+
+SIGHUP through signalfd reloads bounded regular-file certificate/key inputs into a separate generation. Successful validation switches new accepts atomically; active sessions keep the original default/SNI callback registry. At most two generations exist, and an occupied retired slot yields `TlsReloadBusy`. Missing/invalid/mismatched files preserve the current generation. Attempts are separated by one second and never queued; HUP is ignored while draining. File IO and OpenSSL validation are synchronous, so storage latency can delay the event loop. Termination retains the blocked signal mask until process exit to avoid late pending signals interrupting final cleanup.
+
+Metrics add active handshakes, TLS admission rejections, reload outcomes and TLS closure errors. Fast sequential keep-alive requests completing in a single epoll dispatch now each record their response, correcting a counter gap found by the soak workload. Counters remain lossy operational observations through the pipe logger, not a billing/delivery guarantee.
+
+Optional `zig build tls-load -Doptimize=ReleaseSafe` measures 16/64/128/256-client TLS 1.2/1.3 local/proxy workloads and resilience controls. `tools/tls_load.py --soak-seconds 300` (binary positional argument required) enables a separate five-minute soak; use 1800/7200 for longer runs. Drained RSS/fd trends are flagged for investigation, with cache warmup excluded. See [TLS operations](tls.md) and [validation, measurements and runtime status](phase5a-validation.md).

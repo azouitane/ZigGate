@@ -5,6 +5,7 @@ pub const Config = struct {
     cert: ?[]const u8 = null,
     key: ?[]const u8 = null,
     handshake_ms: u16 = 5000,
+    max_handshakes: u16 = 128,
     hosts: [8]Certificate = undefined,
     count: usize = 0,
     pub fn validate(self: Config) !void {

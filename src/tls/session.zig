@@ -2,23 +2,35 @@ const c = @import("context.zig").c;
 const E = @import("std").os.linux.EPOLL;
 pub const Session = struct {
     ssl: ?*c.SSL = null,
+    generation: ?*@import("context.zig").Generation = null,
+    permit: ?*@import("admission.zig").Admission = null,
     want: enum { none, read, write } = .none,
     failed: bool = false,
     write_retry: bool = false,
     established: bool = false,
     closing: bool = false,
-    pub fn init(ctx: *c.SSL_CTX, fd: i32) !Session {
+    pub fn init(generation: *@import("context.zig").Generation, fd: i32, admission: *@import("admission.zig").Admission) !Session {
+        if (!admission.acquire()) return error.TlsAdmissionRejected;
+        errdefer admission.release();
         c.ERR_clear_error();
-        const ssl = c.SSL_new(ctx) orelse return error.TlsAllocationFailed;
+        const ssl = c.SSL_new(generation.default) orelse return error.TlsAllocationFailed;
         errdefer c.SSL_free(ssl);
         if (c.SSL_set_fd(ssl, fd) != 1) return error.TlsSocketFailed;
         c.SSL_set_accept_state(ssl);
-        return .{ .ssl = ssl };
+        generation.retain();
+        return .{ .ssl = ssl, .generation = generation, .permit = admission };
     }
     pub fn deinit(self: *Session) void {
         if (self.ssl) |ssl| c.SSL_free(ssl);
         self.ssl = null;
+        self.finishHandshake();
+        if (self.generation) |generation| generation.release();
+        self.generation = null;
         c.ERR_clear_error();
+    }
+    fn finishHandshake(self: *Session) void {
+        if (self.permit) |permit| permit.release();
+        self.permit = null;
     }
     fn result(self: *Session, rc: c_int) !void {
         const err = c.SSL_get_error(self.ssl, rc);
@@ -39,6 +51,7 @@ pub const Session = struct {
         if (rc != 1) return self.result(rc);
         self.want = .none;
         self.established = true;
+        self.finishHandshake();
     }
     pub fn recv(self: *Session, bytes: []u8) !usize {
         c.ERR_clear_error();
@@ -197,4 +210,33 @@ test "real OpenSSL bounded BIO pair retries and partial writes preserve bytes" {
     var closed_n: usize = 0;
     const closed_rc = c.SSL_read_ex(client, &buffer, buffer.len, &closed_n);
     try std.testing.expectEqual(@as(c_int, c.SSL_ERROR_ZERO_RETURN), c.SSL_get_error(client, closed_rc));
+}
+
+test "handshake permit release is idempotent on success and cleanup" {
+    const std = @import("std");
+    var admission: @import("admission.zig").Admission = .{ .limit = 1 };
+    try std.testing.expect(admission.acquire());
+    var session: Session = .{ .permit = &admission };
+    session.finishHandshake();
+    session.finishHandshake();
+    session.deinit();
+    try std.testing.expectEqual(@as(u16, 0), admission.active);
+}
+
+test "rejected handshakes allocate no SSL and cannot release another permit" {
+    const std = @import("std");
+    var admission: @import("admission.zig").Admission = .{ .limit = 1 };
+    try std.testing.expect(admission.acquire());
+    var generation: @import("context.zig").Generation = .{};
+    try std.testing.expectError(error.TlsAdmissionRejected, Session.init(&generation, -1, &admission));
+    try std.testing.expectEqual(@as(u16, 1), admission.active);
+    try std.testing.expectEqual(@as(usize, 0), generation.references);
+    admission.release();
+    try std.testing.expect(admission.acquire());
+    generation.retain();
+    var session: Session = .{ .permit = &admission, .generation = &generation };
+    session.deinit();
+    session.deinit();
+    try std.testing.expectEqual(@as(u16, 0), admission.active);
+    try std.testing.expectEqual(@as(usize, 0), generation.references);
 }

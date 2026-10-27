@@ -26,6 +26,10 @@ pub fn build(b: *std.Build) void {
     stress.addArtifactArg(exe);
     stress.addArgs(&.{ "--build-mode", @tagName(optimize) });
     b.step("stress", "Measure local and proxy loopback workloads").dependOn(&stress.step);
+    const tls_load = b.addSystemCommand(&.{ "python3", "tools/tls_load.py" });
+    tls_load.addArtifactArg(exe);
+    tls_load.addArgs(&.{ "--build-mode", @tagName(optimize), "--reload-active", "--resilience" });
+    b.step("tls-load", "Run optional TLS load matrix and resilience profile").dependOn(&tls_load.step);
     const unit = b.addTest(.{ .root_module = exe.root_module });
     b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(unit).step);
     const integration = b.addSystemCommand(&.{ "python3", "tests/integration/http_test.py" });
@@ -41,7 +45,11 @@ pub fn build(b: *std.Build) void {
     const tls_tests = b.addSystemCommand(&.{ "python3", "tests/integration/tls_test.py" });
     tls_tests.addArtifactArg(exe);
     b.step("tls-integration", "Run HTTPS/OpenSSL integration tests").dependOn(&tls_tests.step);
+    const reliability = b.addSystemCommand(&.{ "python3", "tests/integration/tls_reliability_test.py" });
+    reliability.addArtifactArg(exe);
+    b.step("tls-reliability", "Run TLS admission and reload regressions").dependOn(&reliability.step);
     const integration_step = b.step("integration", "Run socket integration tests (Python 3)");
+    integration_step.dependOn(&reliability.step);
     integration_step.dependOn(&tls_tests.step);
     integration_step.dependOn(&hardening.step);
     integration_step.dependOn(&integration.step);
