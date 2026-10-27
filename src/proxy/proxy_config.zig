@@ -2,6 +2,7 @@ const std = @import("std");
 pub const Route = struct { prefix: []const u8, authority: []const u8, address: std.net.Address };
 pub const Limits = struct {
     max_active: u16 = 128,
+    pending_bytes: u16 = 16384,
     connect_ms: u16 = 2000,
     read_ms: u16 = 5000,
     write_ms: u16 = 2000,
@@ -16,8 +17,13 @@ pub const Config = struct {
         const eq = std.mem.indexOfScalar(u8, text, '=') orelse return error.InvalidProxyRoute;
         const prefix = text[0..eq];
         const authority = text[eq + 1 ..];
-        if (prefix.len == 0 or prefix[0] != '/') return error.InvalidProxyRoute;
+        if (prefix.len == 0 or prefix.len > 8192 or prefix[0] != '/') return error.InvalidProxyRoute;
         for (prefix) |c| if (c <= 0x20 or c >= 0x7f or c == '?' or c == '#') return error.InvalidProxyRoute;
+        if (std.mem.indexOf(u8, prefix, "//") != null or std.mem.indexOfScalar(u8, prefix, '%') != null or std.mem.indexOfScalar(u8, prefix, '\\') != null) return error.InvalidProxyRoute;
+        var segments = std.mem.splitScalar(u8, prefix, '/');
+        while (segments.next()) |segment| {
+            if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.InvalidProxyRoute;
+        }
         const colon = std.mem.indexOfScalar(u8, authority, ':') orelse return error.InvalidUpstream;
         const port_text = authority[colon + 1 ..];
         if (port_text.len == 0) return error.InvalidUpstream;
@@ -34,7 +40,7 @@ pub const Config = struct {
         for ([_][]const u8{ "/", "/health", "/ready" }) |internal| if (std.mem.eql(u8, path, internal)) return null;
         var selected: ?usize = null;
         for (self.routes[0..self.count], 0..) |route, i| {
-            if (std.mem.startsWith(u8, path, route.prefix) and (selected == null or route.prefix.len > self.routes[selected.?].prefix.len)) selected = i;
+            if (std.mem.startsWith(u8, path, route.prefix) and (std.mem.endsWith(u8, route.prefix, "/") or path.len == route.prefix.len or path[route.prefix.len] == '/') and (selected == null or route.prefix.len > self.routes[selected.?].prefix.len)) selected = i;
         }
         return selected;
     }
@@ -49,4 +55,13 @@ test "validated routes and longest prefix with internal precedence" {
     try std.testing.expectEqual(@as(?usize, null), config.match("/health?q=1"));
     try std.testing.expectError(error.DuplicateProxyRoute, config.add("/api/=127.0.0.1:9000"));
     for ([_][]const u8{ "/x=localhost:80", "/x=127.0.0.1:0", "/x=127.0.0.1:65536", "/x=127.0.0.1:+80", "/x=http://127.0.0.1:80", "x=127.0.0.1:80" }) |bad| try std.testing.expectError(if (bad[0] == '/') error.InvalidUpstream else error.InvalidProxyRoute, config.add(bad));
+}
+
+test "segment boundaries and ambiguous prefixes" {
+    var config: Config = .{};
+    try config.add("/home=127.0.0.1:3000");
+    try std.testing.expectEqual(@as(?usize, 0), config.match("/home"));
+    try std.testing.expectEqual(@as(?usize, 0), config.match("/home/user"));
+    try std.testing.expectEqual(@as(?usize, null), config.match("/homepage"));
+    for ([_][]const u8{ "/a/../b=127.0.0.1:80", "/a//b=127.0.0.1:80", "/%61=127.0.0.1:80", "/a\\b=127.0.0.1:80" }) |bad| try std.testing.expectError(error.InvalidProxyRoute, config.add(bad));
 }

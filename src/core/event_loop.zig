@@ -7,6 +7,7 @@ const Options = @import("../cli/commands.zig").Options;
 const response = @import("../http/response.zig");
 const Upstream = @import("../proxy/upstream_connection.zig").Upstream;
 const upstream_bit: u64 = 1 << 31;
+const signal_token = std.math.maxInt(u64) - 1;
 const listener_token = std.math.maxInt(u64);
 
 fn register(epfd: i32, op: u32, fd: i32, events: u32, token: u64) !void {
@@ -49,12 +50,35 @@ fn proxyInterest(epfd: i32, c: *Connection, u: *Upstream, index: usize) !void {
 }
 fn proxyFailure(epfd: i32, c: *Connection, u: *Upstream, status: u16, now: u64, options: Options, index: usize) !bool {
     const committed = u.committed;
+    c.bytes_sent = u.bytes_sent;
+    c.status = if (committed) u.status else status;
     u.deinit(epfd);
     c.upstream = null;
     if (committed) return false;
     try c.respond(response.failure(status), std.mem.startsWith(u8, c.input[0..c.used], "HEAD "), true, now, options);
     try interest(epfd, c, index);
     return true;
+}
+
+fn retire(epfd: i32, c: *Connection, upstreams: []Upstream, metrics: *@import("../observability/metrics.zig").Metrics, logger: *@import("../observability/logger.zig").Logger, now: u64, options: Options) void {
+    observe(c, upstreams, metrics, logger, now, options);
+    release(epfd, c, upstreams);
+}
+
+fn observe(c: *Connection, upstreams: []Upstream, metrics: *@import("../observability/metrics.zig").Metrics, logger: *@import("../observability/logger.zig").Logger, now: u64, options: Options) void {
+    if (c.counted) return;
+    var status = c.status;
+    var bytes = c.bytes_sent;
+    if (c.upstream) |i| {
+        status = upstreams[i].status;
+        bytes = upstreams[i].bytes_sent;
+    }
+    if (status == 0) return;
+    c.counted = true;
+    const duration = now - c.started;
+    metrics.response(status, duration);
+    const upstream = if (c.proxied) options.proxy.routes[c.proxy_route].authority else "";
+    logger.event(.info, "http_request", .{ .status = status, .duration_ms = duration, .bytes_sent = bytes, .upstream = upstream });
 }
 
 const SocketIO = struct {
@@ -78,6 +102,9 @@ fn drive(c: *Connection, events: u32, now: u64, options: Options, io: anytype) !
         if (n == 0) return false;
         if (c.state == .idle) {
             c.state = .reading;
+            c.status = 0;
+            c.counted = false;
+            c.bytes_sent = 0;
             c.deadline = now + options.timeout_ms;
         }
         c.used += n;
@@ -90,6 +117,7 @@ fn drive(c: *Connection, events: u32, now: u64, options: Options, io: anytype) !
         };
         if (n == 0) return false;
         c.advance(n);
+        c.bytes_sent +|= n;
         if (c.pending().len == 0) {
             if (c.close or c.peer_eof) return false;
             c.used = 0;
@@ -101,6 +129,16 @@ fn drive(c: *Connection, events: u32, now: u64, options: Options, io: anytype) !
 }
 
 pub fn run(listener: i32, options: Options) !void {
+    var listener_open = true;
+    defer if (listener_open) p.close(listener);
+    var shutdown = try @import("shutdown.zig").Shutdown.init();
+    defer shutdown.deinit();
+    var logger = @import("../observability/logger.zig").Logger.init(options.log_level);
+    defer logger.deinit();
+    defer logger.event(.info, "server_stop", .{ .dropped_logs = logger.dropped });
+    var metrics: @import("../observability/metrics.zig").Metrics = .{};
+    logger.event(.info, "server_start", .{ .port = options.port, .max_connections = options.max_connections });
+    var timer = try std.time.Timer.start();
     const epfd = try p.epoll_create1(E.CLOEXEC);
     defer p.close(epfd);
     const slots = try std.heap.page_allocator.alloc(Connection, options.max_connections);
@@ -112,17 +150,44 @@ pub fn run(listener: i32, options: Options) !void {
         c.fd = -1;
         c.generation = 0;
     }
+    defer {
+        metrics.active_clients = 0;
+        metrics.active_upstreams = 0;
+        metrics.uptime_ms = timer.read() / std.time.ns_per_ms;
+        logger.event(.info, "metrics", metrics);
+    }
     defer for (slots) |*c| {
-        if (c.fd != -1) release(epfd, c, upstreams);
+        if (c.fd != -1) retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
     };
     try register(epfd, E.CTL_ADD, listener, E.IN, listener_token);
+    try register(epfd, E.CTL_ADD, shutdown.fd, E.IN, signal_token);
     var listener_paused = false;
     var retry_at: u64 = 0;
-    var timer = try std.time.Timer.start();
+
     var events: [128]linux.epoll_event = undefined;
+    var next_metrics: u64 = 1000;
     while (true) {
         var now = timer.read() / std.time.ns_per_ms;
-        if (listener_paused and now >= retry_at) {
+        metrics.active_clients = 0;
+        metrics.active_upstreams = 0;
+        for (slots) |c| {
+            if (c.fd != -1) metrics.active_clients += 1;
+        }
+        for (upstreams) |u| {
+            if (u.active and u.fd != -1) metrics.active_upstreams += 1;
+        }
+        metrics.uptime_ms = now;
+        if (now >= next_metrics) {
+            logger.event(.info, "metrics", metrics);
+            next_metrics = now + 1000;
+        }
+        if (shutdown.state != .running) {
+            if (shutdown.state == .forced or now >= shutdown.deadline or metrics.active_clients == 0) {
+                logger.event(.info, "shutdown_complete", .{ .forced = shutdown.state == .forced or now >= shutdown.deadline, .remaining = metrics.active_clients });
+                break;
+            }
+        }
+        if (shutdown.state == .running and listener_paused and now >= retry_at) {
             try register(epfd, E.CTL_ADD, listener, E.IN, listener_token);
             listener_paused = false;
         }
@@ -130,11 +195,26 @@ pub fn run(listener: i32, options: Options) !void {
         // Check deadlines before processing readiness, including continuously ready sockets.
         for (slots, 0..) |*c, index| {
             if (c.fd == -1) continue;
+            if (shutdown.state != .running) {
+                c.draining = true;
+                c.close = true;
+                if (c.state == .idle or (c.state == .reading and c.used == 0)) {
+                    retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
+                    continue;
+                }
+            }
+            if (c.state != .idle and now >= c.started + options.request_ms) {
+                retire(epfd, c, upstreams, &metrics, &logger, now, options);
+                continue;
+            }
+            if (c.state != .idle) wait_ms = @min(wait_ms, c.started + options.request_ms - now);
             if (c.state == .proxy) {
                 const u = &upstreams[c.upstream.?];
                 if (u.expired(now)) {
+                    metrics.proxy_failures +|= 1;
+                    logger.event(.warn, "proxy_failure", .{ .status = @as(u16, 504) });
                     if (!(proxyFailure(epfd, c, u, 504, now, options, index) catch false)) {
-                        release(epfd, c, upstreams);
+                        retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                         continue;
                     }
                 } else {
@@ -146,20 +226,21 @@ pub fn run(listener: i32, options: Options) !void {
             if (c.expired(now)) {
                 if (c.state == .reading) {
                     c.respond(response.failure(408), std.mem.startsWith(u8, c.input[0..c.used], "HEAD "), true, now, options) catch {
-                        release(epfd, c, upstreams);
+                        retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                         continue;
                     };
                     interest(epfd, c, index) catch {
-                        release(epfd, c, upstreams);
+                        retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                         continue;
                     };
                 } else {
-                    release(epfd, c, upstreams);
+                    retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                     continue;
                 }
             }
             wait_ms = @min(wait_ms, c.deadline - now);
         }
+        if (shutdown.state == .draining) wait_ms = @min(wait_ms, shutdown.deadline - now);
         // Use the raw wait so EINTR returns to deadline processing rather than restarting a full wait.
         const rc = linux.epoll_wait(epfd, &events, events.len, @intCast(wait_ms));
         const count: usize = switch (p.errno(rc)) {
@@ -168,9 +249,29 @@ pub fn run(listener: i32, options: Options) !void {
             else => return error.EpollWaitFailed,
         };
         now = timer.read() / std.time.ns_per_ms;
+        // Process termination before any accepts in this readiness batch.
         for (events[0..count]) |event| {
+            if (event.data.u64 != signal_token) continue;
+            var records: [128]u8 = undefined;
+            while (true) {
+                const n = p.read(shutdown.fd, &records) catch break;
+                if (n == 0) break;
+                const was_running = shutdown.state == .running;
+                shutdown.signal(now, options.shutdown_ms);
+                if (was_running) {
+                    if (!listener_paused) try p.epoll_ctl(epfd, E.CTL_DEL, listener, null);
+                    listener_paused = true;
+                    p.close(listener);
+                    listener_open = false;
+                    logger.event(.info, "shutdown_begin", .{ .grace_ms = options.shutdown_ms });
+                }
+            }
+        }
+        if (shutdown.state == .forced) continue;
+        for (events[0..count]) |event| {
+            if (event.data.u64 == signal_token) continue;
             if (event.data.u64 == listener_token) {
-                if (listener_paused) continue;
+                if (listener_paused or shutdown.state != .running) continue;
                 // Bound accept work per batch so a connection flood cannot starve existing clients.
                 for (0..64) |_| {
                     var peer: std.net.Address = undefined;
@@ -180,7 +281,7 @@ pub fn run(listener: i32, options: Options) !void {
                         error.ConnectionAborted => continue,
                         else => {
                             // Quota/resource failure: stop listener readiness spin and retry later.
-                            std.log.warn("accept failed: {s}", .{@errorName(err)});
+                            logger.event(.warn, "accept_failure", .{});
                             try p.epoll_ctl(epfd, E.CTL_DEL, listener, null);
                             listener_paused = true;
                             retry_at = now + 100;
@@ -195,12 +296,14 @@ pub fn run(listener: i32, options: Options) !void {
                         }
                     }
                     const index = free orelse {
+                        metrics.connection_rejections +|= 1;
+                        logger.event(.warn, "connection_rejected", .{});
                         p.close(fd);
                         continue;
                     };
                     const c = &slots[index];
                     const generation = c.generation +% 1;
-                    c.* = .{ .fd = fd, .generation = generation, .deadline = now + options.timeout_ms, .peer_ip = @bitCast(peer.in.sa.addr) };
+                    c.* = .{ .fd = fd, .generation = generation, .started = now, .deadline = now + options.timeout_ms, .peer_ip = @bitCast(peer.in.sa.addr) };
                     register(epfd, E.CTL_ADD, fd, E.IN | (if (c.peer_eof) @as(u32, 0) else E.RDHUP), tokenFor(c, index)) catch {
                         p.close(fd);
                         c.fd = -1;
@@ -214,33 +317,40 @@ pub fn run(listener: i32, options: Options) !void {
             if (index >= slots.len) continue;
             const c = &slots[index];
             if (c.fd == -1 or tokenFor(c, index) != client_token) continue;
+            if (c.state != .idle and now >= c.started + options.request_ms) {
+                retire(epfd, c, upstreams, &metrics, &logger, now, options);
+                continue;
+            }
             if (c.state == .proxy) {
                 const u = &upstreams[c.upstream.?];
                 if (u.expired(now)) continue;
                 var alive = true;
                 if (is_upstream) {
                     u.onUpstream(now, options.proxy_limits, options.timeout_ms) catch |err| {
+                        metrics.proxy_failures +|= 1;
+                        logger.event(.warn, "proxy_failure", .{});
                         alive = proxyFailure(epfd, c, u, if (err == error.ConnectionTimedOut) 504 else 502, now, options, index) catch false;
                     };
                 } else {
                     if (event.events & (E.ERR | E.HUP) != 0) {
-                        release(epfd, c, upstreams);
+                        retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                         continue;
                     }
                     if (event.events & E.RDHUP != 0) c.peer_eof = true;
                 }
                 if (!alive) {
-                    release(epfd, c, upstreams);
+                    retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                     continue;
                 }
                 if (c.state == .proxy) {
                     alive = u.flushClient(c.fd, now, options.proxy_limits) catch false;
                     if (!alive) {
-                        release(epfd, c, upstreams);
+                        retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                         continue;
                     }
+                    u.total_deadline = @min(u.total_deadline, c.started + options.request_ms);
                     proxyInterest(epfd, c, u, index) catch {
-                        if (!(proxyFailure(epfd, c, u, 503, now, options, index) catch false)) release(epfd, c, upstreams);
+                        if (!(proxyFailure(epfd, c, u, 503, now, options, index) catch false)) retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                     };
                 }
                 continue;
@@ -248,9 +358,24 @@ pub fn run(listener: i32, options: Options) !void {
             if (is_upstream) continue;
             // Readiness returned at the deadline must not extend an expired operation.
             if (c.expired(now)) continue;
+            if (shutdown.state != .running and (c.state == .idle or (c.state == .reading and c.used == 0))) {
+                retire(epfd, c, upstreams, &metrics, &logger, now, options);
+                continue;
+            }
+            if (shutdown.state != .running) {
+                c.draining = true;
+                c.close = true;
+            }
+            const previous_state = c.state;
+            const previous_requests = c.requests;
+            const previous_used = c.used;
+            if (previous_state == .idle) c.started = now;
             const alive = drive(c, event.events, now, options, SocketIO{ .fd = c.fd }) catch false;
+            if (previous_used == 0 and c.used != 0) logger.event(.debug, "request_started", .{});
+            if (c.requests != previous_requests or (c.status != 0 and previous_state == .reading)) metrics.requests +|= 1;
+            if (c.state == .idle and previous_state != .idle) observe(c, upstreams, &metrics, &logger, now, options);
             if (!alive) {
-                release(epfd, c, upstreams);
+                retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                 continue;
             }
             if (c.state == .proxy) {
@@ -266,6 +391,8 @@ pub fn run(listener: i32, options: Options) !void {
                     const u = &upstreams[i];
                     const end = std.mem.indexOf(u8, c.input[0..c.used], "\r\n\r\n").? + 4;
                     u.start(c.input[0..end], options.proxy.routes[c.proxy_route], c.peer_ip, options.proxy_limits, now) catch |err| {
+                        metrics.proxy_failures +|= 1;
+                        logger.event(.warn, "proxy_failure", .{ .upstream = options.proxy.routes[c.proxy_route].authority });
                         const status: u16 = switch (err) {
                             error.InvalidHeaders => 400,
                             error.UnsupportedUpgrade => 501,
@@ -274,20 +401,22 @@ pub fn run(listener: i32, options: Options) !void {
                             error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => 503,
                             else => 502,
                         };
-                        if (!(proxyFailure(epfd, c, u, status, now, options, index) catch false)) release(epfd, c, upstreams);
+                        if (!(proxyFailure(epfd, c, u, status, now, options, index) catch false)) retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                         continue;
                     };
+                    u.total_deadline = @min(u.total_deadline, c.started + options.request_ms);
                     proxyInterest(epfd, c, u, index) catch {
-                        if (!(proxyFailure(epfd, c, u, 503, now, options, index) catch false)) release(epfd, c, upstreams);
+                        if (!(proxyFailure(epfd, c, u, 503, now, options, index) catch false)) retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                     };
                 } else {
+                    logger.event(.warn, "upstream_capacity", .{});
                     try c.respond(response.failure(503), std.mem.startsWith(u8, c.input[0..c.used], "HEAD "), true, now, options);
                     interest(epfd, c, index) catch {
-                        release(epfd, c, upstreams);
+                        retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                     };
                 }
             } else interest(epfd, c, index) catch {
-                release(epfd, c, upstreams);
+                retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
             };
         }
     }

@@ -15,6 +15,12 @@ pub const Connection = struct {
     output_len: usize = 0,
     sent: usize = 0,
     requests: u16 = 0,
+    draining: bool = false,
+    started: u64 = 0,
+    status: u16 = 0,
+    counted: bool = false,
+    proxied: bool = false,
+    bytes_sent: u64 = 0,
     close: bool = true,
     peer_eof: bool = false,
     peer_ip: [4]u8 = .{ 127, 0, 0, 1 },
@@ -25,6 +31,7 @@ pub const Connection = struct {
         return now >= self.deadline;
     }
     pub fn respond(self: *Connection, r: response.Response, head: bool, close: bool, now: u64, options: Options) !void {
+        self.status = r.status;
         self.output_len = (try r.serializeConnection(&self.output, head, close)).len;
         self.sent = 0;
         self.close = close;
@@ -33,6 +40,7 @@ pub const Connection = struct {
     }
     pub fn process(self: *Connection, now: u64, options: Options) !void {
         if (std.mem.indexOf(u8, self.input[0..self.used], "\r\n\r\n")) |end| {
+            if (end + 4 > options.header_bytes) return self.respond(response.failure(431), false, true, now, options);
             const bytes = self.input[0 .. end + 4];
             const head = std.mem.startsWith(u8, bytes, "HEAD ");
             const request = parser.parse(bytes) catch |err| {
@@ -46,15 +54,16 @@ pub const Connection = struct {
             };
             self.requests += 1;
             // Never dispatch surplus bytes as another request. Close after the first response.
-            const close = request.close or self.peer_eof or self.used != end + 4 or self.requests >= options.max_requests;
+            const close = self.draining or request.close or self.peer_eof or self.used != end + 4 or self.requests >= options.max_requests;
             if (options.proxy.match(request.target)) |route| {
+                self.proxied = true;
                 self.proxy_route = route;
                 self.state = .proxy;
                 self.close = true;
                 return;
             }
             try self.respond(router.route(request), head, close, now, options);
-        } else if (self.used == self.input.len) {
+        } else if (self.used >= options.header_bytes) {
             try self.respond(response.failure(431), std.mem.startsWith(u8, self.input[0..self.used], "HEAD "), true, now, options);
         }
     }
@@ -164,4 +173,14 @@ test "proxy dispatch follows validation and preserves internal routes" {
     try std.testing.expectEqual(State.writing, c.state);
     try std.testing.expect(c.close);
     try std.testing.expect(std.mem.startsWith(u8, c.pending(), "HTTP/1.1 501 "));
+}
+
+test "configured client header ceiling applies before dispatch" {
+    var c: Connection = .{};
+    const raw = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
+    @memcpy(c.input[0..raw.len], raw);
+    c.used = raw.len;
+    try c.process(0, .{ .header_bytes = raw.len - 1 });
+    try std.testing.expectEqual(@as(u16, 431), c.status);
+    try std.testing.expect(c.close);
 }

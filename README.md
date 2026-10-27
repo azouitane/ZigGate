@@ -1,6 +1,6 @@
 # ZigGate
 
-ZigGate is an Apache-2.0 HTTP/1.1 server and reverse proxy written in **Zig 0.15.2**, targeting Linux x86_64 and aarch64. Phase 3 adds asynchronous upstream connections and bounded response streaming to the existing level-triggered epoll engine. This is an incremental implementation, without production security or load validation.
+ZigGate is an Apache-2.0 HTTP/1.1 server and reverse proxy written in **Zig 0.15.2**, targeting Linux x86_64 and aarch64. Phase 4A adds signal-driven graceful shutdown, bounded JSONL logging, operational metrics, configurable limits and stricter configuration/path validation. This remains an incremental implementation, without production security certification. See [operational notes](docs/production-hardening.md) and [validation results](docs/phase4a-validation.md).
 
 ## Build and run
 
@@ -32,7 +32,7 @@ GET `/` returns `Welcome to ZigGate!`, `/health` returns `ok`, and `/ready` retu
 
 Repeat `--proxy /prefix/=IPv4:port` for up to 16 routes. Configuration is validated at startup; duplicate prefixes, hostnames, URL schemes, invalid numeric IPv4 addresses, and invalid/zero ports are rejected. Prefixes must start with `/` and cannot contain whitespace, non-ASCII bytes, `?`, or `#`. There is no runtime DNS lookup and no destination chosen from client headers or request targets. Invalid CLI arguments exit with status 2; startup failures propagate as errors.
 
-Selection order is: exact internal path first, then the longest matching configured prefix, then the original local router. Prefix matching uses the raw path before `?`, without decoding, normalization, or case folding. It is a literal prefix: configure `/api/` to avoid also matching `/apix`. The original method and full target, including query string, are forwarded unchanged. No prefix stripping, redirects, or arbitrary target proxying are performed.
+Selection order is: exact internal path first, then the longest matching configured prefix, then the original local router. Prefix matching uses the raw path before `?`, without decoding, normalization, or case folding. Prefixes match segment boundaries: `/api` matches `/api` and `/api/x`, but not `/apix`. `/api/` retains a required trailing slash. Ambiguous prefixes and traversal-style request paths are rejected; see the operational notes. The original method and full target, including query string, are forwarded unchanged. No prefix stripping, redirects, or arbitrary target proxying are performed.
 
 On configured proxy paths, the existing parser accepts known HTTP methods with no body; CONNECT and explicit Upgrade requests receive 501. On local paths, existing method restrictions remain. Both the backend connection and the client connection close after a proxied response. Sequential keep-alive remains available for local requests; a local persistent connection may subsequently send one proxied request, which closes after its response. There is no upstream pooling or retry.
 
@@ -46,6 +46,12 @@ Configuration uses CLI arguments; there is no JSON configuration or hot reload i
 
 | Option | Default | Accepted range / meaning |
 | --- | --- | --- |
+| `--shutdown-ms` | `10000` | 1–60000; absolute graceful shutdown deadline |
+| `--request-ms` | `60000` | 1–60000; total active request duration |
+| `--header-bytes` | `8192` | 1–8192; inclusive request-header cap |
+| `--pending-output-bytes` | `16384` | 1024–16384; proxy pending output cap (local cap: 1024) |
+| `--log-level` | `info` | debug, info, warn, error; JSONL to nonblocking stderr pipes |
+| `--check-config` | off | Validate arguments and exit without serving |
 | `--bind` | `127.0.0.1` | IPv4 listener address |
 | `--port` | `8080` | 1–65535 |
 | `--timeout-ms` | `2000` | 1–60000; client header deadline and separate local-response/proxy-chunk write deadline |
@@ -94,9 +100,9 @@ The dedicated raw mock-backend suite covers successful GETs, longest prefixes, i
 
 The proxy fixture explicitly uses a 256-connection listen backlog. Inspection of Python 3.14 confirmed that the previous threaded backend inherited `TCPServer.request_queue_size = 5`: handler threads start only after acceptance and do not enlarge this queue. A burst could therefore overflow the backend queue and trigger genuine proxy timeouts even with fast handlers. The previous 64-request workload also used only 32 workers. The regressions now use synchronized waves of 64 and 100 workers, plus a direct 100-client backend preflight with a 500 ms IO budget. The ordinary gateway connect/read/write deadlines remain 500 ms; they were not increased to fix the load test. Socket-free fixture tests check the real server activation path's listen argument and threaded dispatch policy before the proxy integration suite starts.
 
-Separate slow/late upstream cases remain. An event-gated slow request proves the backend has received the request before testing read timeout and progress by local/fast proxy clients. A Linux backlog-zero listener with a filled accept queue and a verified pending probe isolates connect timeout: it uses a 100 ms connect deadline and a distinct 3-second read deadline, then repeats timeouts while checking descriptors. This fixture fails explicitly if the kernel does not provide the required pending-connect condition. Client disconnects now happen after forwarding starts; descriptor accounting includes repeated successful requests as well as malformed/refused requests. These new live checks still require execution outside the sandbox; the backlog defect is confirmed by source/activation checks, but the reported HTTP 504 has not been reproduced here.
+Separate slow/late upstream cases remain. An event-gated slow request proves the backend has received the request before testing read timeout and progress by local/fast proxy clients. A Linux backlog-zero listener with a filled accept queue and a verified pending probe isolates connect timeout: it uses a 100 ms connect deadline and a distinct 3-second read deadline, then repeats timeouts while checking descriptors. This fixture fails explicitly if the kernel does not provide the required pending-connect condition. Client disconnects now happen after forwarding starts; descriptor accounting includes repeated successful requests as well as malformed/refused requests. These live checks were executed with the loopback permissions required by this environment.
 
-Phase 3 verification in this environment: **31 Zig unit tests and 2 socket-free Python fixture tests passed**, native Debug and ReleaseSafe builds passed, formatting passed, and Linux aarch64 ReleaseSafe cross-compilation passed. `zig build integration` was executed, but **all three suites were blocked at socket creation** (`PermissionError: Operation not permitted`). Phase 1/2 local integration validation was supplied by the user. Phase 3 TCP behavior has not been verified in this sandbox. Run the full integration command on a Linux host with loopback permissions before treating this milestone as validated.
+Phase 4A verification includes all existing suites and new signal, streaming drain, deadline, high concurrency shutdown, slow logging, redaction and configuration checks. See the [validation record](docs/phase4a-validation.md) for actual commands and results.
 
 Individual scripts accept a binary path:
 
@@ -112,6 +118,6 @@ If the global Zig cache is restricted, prefix commands with `ZIG_GLOBAL_CACHE_DI
 
 ## Limitations and next steps
 
-No TLS, ACME, HTTP/2, HTTP/3, WebSocket tunneling, chunked response decoding, request bodies, DNS resolution, upstream pooling, retries, load balancing, active health checks, static files, virtual hosts, JSON configuration, or graceful signal-driven draining is implemented. The single event-loop thread scans bounded slot arrays. Host validation on incoming requests remains lexical rather than complete authority validation. Upstream destinations are administrator-controlled and should be trusted to receive forwarded end-to-end request fields; client forwarding metadata is always discarded. There is no application rate limiter, security audit, or verified throughput claim.
+No TLS, ACME, HTTP/2, HTTP/3, WebSocket tunneling, chunked response decoding, request bodies, DNS resolution, upstream pooling, retries, load balancing, active health checks, static files, virtual hosts, or JSON configuration are implemented. The single event-loop thread scans bounded slot arrays. Host validation on incoming requests remains lexical rather than complete authority validation. Upstream destinations are administrator-controlled and should be trusted to receive forwarded end-to-end request fields; client forwarding metadata is always discarded. There is no application rate limiter, security audit, or production capacity claim.
 
-Next: run all socket suites outside the sandbox and resolve any failures, then perform load/security testing and resource-exhaustion experiments. Phase 4 has not been started. See [architecture](docs/architecture.md) for ownership and state transitions.
+Next: broaden load/security testing and resource-exhaustion experiments. Phase 4B should design nonblocking TLS transport, certificate lifecycle and handshake limits. See [architecture](docs/architecture.md) for ownership and state transitions.

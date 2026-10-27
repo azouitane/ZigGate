@@ -20,6 +20,8 @@ pub const State = enum { connecting, sending, headers, body, done };
 /// One bounded transaction; no descriptors or borrowed request slices survive deinit.
 pub const Upstream = struct {
     active: bool = false,
+    status: u16 = 0,
+    bytes_sent: u64 = 0,
     fd: i32 = -1,
     registered: bool = false,
     state: State = .connecting,
@@ -75,12 +77,14 @@ pub const Upstream = struct {
         if (std.mem.indexOf(u8, self.header[0..self.header_used], "\r\n\r\n")) |end| {
             const header_len = end + 4;
             const result = try protocol.response(self.header[0..header_len], self.head, &self.output);
+            self.status = try std.fmt.parseInt(u16, self.header[9..12], 10);
             const body = self.header[header_len..self.header_used];
             if (result.framing.length) |length| {
                 if (body.len > length) return error.InvalidResponse;
                 self.remaining = length - body.len;
             } else self.remaining = null;
             self.state = if (self.remaining != null and self.remaining.? == 0) .done else .body;
+            if (result.len + body.len > limits.pending_bytes) return error.InvalidResponse;
             @memcpy(self.output[result.len..][0..body.len], body);
             self.output_len = result.len + body.len;
             self.output_sent = 0;
@@ -138,7 +142,7 @@ pub const Upstream = struct {
             // Absolute header deadline: fragments cannot extend it.
             try self.feedHeaders(now, limits, client_timeout);
         } else if (self.state == .body) {
-            const capacity: usize = @intCast(@min(@as(u64, 8192), self.remaining orelse 8192));
+            const capacity: usize = @intCast(@min(@as(u64, @min(8192, limits.pending_bytes)), self.remaining orelse 8192));
             const n = io.recv(self.output[0..capacity]) catch |err| switch (err) {
                 error.WouldBlock => return,
                 else => return err,
@@ -150,6 +154,7 @@ pub const Upstream = struct {
         std.debug.assert(count <= self.pending().len);
         self.committed = self.committed or count != 0;
         self.output_sent += count;
+        self.bytes_sent +|= count;
         if (self.pending().len == 0) {
             self.output_len = 0;
             self.output_sent = 0;
@@ -326,5 +331,15 @@ test "pending connect and partial headers cannot extend stage deadlines" {
     }
     try std.testing.expect(u.header_used > 0);
     try std.testing.expect(u.expired(100));
+    try std.testing.expect(!u.committed);
+}
+
+test "configured pending output ceiling rejects oversized first block" {
+    var u: Upstream = .{ .state = .headers };
+    const header = "HTTP/1.1 200 OK\r\nContent-Length: 2048\r\n\r\n";
+    @memcpy(u.header[0..header.len], header);
+    @memset(u.header[header.len..][0..1500], 'x');
+    u.header_used = header.len + 1500;
+    try std.testing.expectError(error.InvalidResponse, u.feedHeaders(0, .{ .pending_bytes = 1024 }, 100));
     try std.testing.expect(!u.committed);
 }

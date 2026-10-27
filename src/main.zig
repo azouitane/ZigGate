@@ -14,6 +14,10 @@ pub fn main() !void {
         std.debug.print("{s}", .{cli.usage});
         return;
     }
+    if (options.check_config) {
+        std.debug.print("configuration valid\n", .{});
+        return;
+    }
     try @import("core/server.zig").run(options);
 }
 test {

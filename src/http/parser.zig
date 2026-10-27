@@ -19,6 +19,21 @@ pub fn parse(bytes: []const u8) ParseError!Request {
     const version = parts.next() orelse return error.BadRequest;
     if (parts.next() != null or !token(method) or target.len == 0 or target[0] != '/') return error.BadRequest;
     for (target) |c| if (c <= 0x20 or c >= 0x7f or c == '#') return error.BadRequest;
+    // Never decode or normalize routing paths across a proxy trust boundary.
+    const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+    if (std.mem.indexOf(u8, path, "//") != null or std.mem.indexOfScalar(u8, path, '\\') != null) return error.BadRequest;
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| {
+        if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.BadRequest;
+    }
+    var offset: usize = 0;
+    while (offset < path.len) : (offset += 1) {
+        if (path[offset] != '%') continue;
+        if (path.len - offset < 3) return error.BadRequest;
+        const decoded = std.fmt.parseInt(u8, path[offset + 1 ..][0..2], 16) catch return error.BadRequest;
+        if (decoded <= 0x20 or decoded == 0x7f or decoded == '/' or decoded == '\\' or decoded == '.' or decoded == '%') return error.BadRequest;
+        offset += 2;
+    }
     if (!std.mem.eql(u8, version, "HTTP/1.1")) {
         if (std.mem.eql(u8, version, "HTTP/1.0") or std.mem.eql(u8, version, "HTTP/2.0")) return error.VersionNotSupported;
         return error.BadRequest;
@@ -39,7 +54,7 @@ pub fn parse(bytes: []const u8) ParseError!Request {
             var tokens = std.mem.splitScalar(u8, value, ',');
             while (tokens.next()) |item| {
                 const option = std.mem.trim(u8, item, " \t");
-                if (!token(option)) return error.BadRequest;
+                if (!token(option) or std.ascii.eqlIgnoreCase(option, "host") or std.ascii.eqlIgnoreCase(option, "content-length") or std.ascii.eqlIgnoreCase(option, "transfer-encoding")) return error.BadRequest;
                 if (std.ascii.eqlIgnoreCase(option, "close")) close = true;
             }
         } else if (std.ascii.eqlIgnoreCase(name, "host")) {
@@ -89,4 +104,12 @@ test "connection close wins across repeated token lists" {
     try std.testing.expect((try parse("GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, CLOSE\r\nConnection: keep-alive\r\n\r\n")).close);
     try std.testing.expect(!(try parse("GET / HTTP/1.1\r\nHost: x\r\n\r\n")).close);
     try std.testing.expectError(error.BadRequest, parse("GET / HTTP/1.1\r\nHost: x\r\nConnection: close,\r\n\r\n"));
+}
+
+test "ambiguous proxy paths and encoded traversal are rejected" {
+    for ([_][]const u8{ "/a/../b", "/a/./b", "//a", "/a\\b", "/%2e%2E/a", "/%2fadmin", "/%255c", "/%", "/%zz" }) |path| {
+        var buffer: [256]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&buffer, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{path});
+        try std.testing.expectError(error.BadRequest, parse(wire));
+    }
 }
