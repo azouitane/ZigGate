@@ -4,6 +4,9 @@ const parser = @import("../http/parser.zig");
 const Route = @import("proxy_config.zig").Route;
 
 pub fn request(raw: []const u8, route: Route, peer: [4]u8, output: []u8) ![]const u8 {
+    return requestScheme(raw, route, peer, output, false);
+}
+pub fn requestScheme(raw: []const u8, route: Route, peer: [4]u8, output: []u8, secure: bool) ![]const u8 {
     const req = try parser.parse(raw);
     if (h.equal(req.method, "CONNECT")) return error.UnsupportedUpgrade;
     try h.validate(raw);
@@ -22,7 +25,7 @@ pub fn request(raw: []const u8, route: Route, peer: [4]u8, output: []u8) ![]cons
     const ip = try std.fmt.bufPrint(&peer_buffer, "{d}.{d}.{d}.{d}", .{ peer[0], peer[1], peer[2], peer[3] });
     try out.field("Host", route.authority);
     try out.field("X-Forwarded-For", ip);
-    try out.field("X-Forwarded-Proto", "http");
+    try out.field("X-Forwarded-Proto", if (secure) "https" else "http");
     try out.add("Content-Length: 0\r\nConnection: close\r\n\r\n");
     return output[0..out.len];
 }

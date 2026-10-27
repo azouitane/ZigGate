@@ -14,11 +14,17 @@ pub fn main() !void {
         std.debug.print("{s}", .{cli.usage});
         return;
     }
+    var contexts: @import("tls/context.zig").Contexts = .{};
+    contexts.init(options.tls) catch |err| {
+        std.debug.print("ziggate: {s}: check TLS certificate chain, unencrypted PEM key, matching key and file permissions\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
+    defer contexts.deinit();
     if (options.check_config) {
         std.debug.print("configuration valid\n", .{});
         return;
     }
-    try @import("core/server.zig").run(options);
+    try @import("core/server.zig").run(options, &contexts);
 }
 test {
     std.testing.refAllDeclsRecursive(@This());

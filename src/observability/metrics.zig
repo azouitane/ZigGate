@@ -1,5 +1,12 @@
 /// Event-loop owned, fixed-size counters. Snapshots are emitted as JSONL.
 pub const Metrics = struct {
+    active_tls: u64 = 0,
+    tls_handshake_successes: u64 = 0,
+    tls_handshake_failures: u64 = 0,
+    tls_handshake_timeouts: u64 = 0,
+    tls_1_2: u64 = 0,
+    tls_1_3: u64 = 0,
+    tls_shutdown_failures: u64 = 0,
     active_clients: u64 = 0,
     active_upstreams: u64 = 0,
     requests: u64 = 0,

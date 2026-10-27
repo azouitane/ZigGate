@@ -1,10 +1,10 @@
 # ZigGate
 
-ZigGate is an Apache-2.0 HTTP/1.1 server and reverse proxy written in **Zig 0.15.2**, targeting Linux x86_64 and aarch64. Phase 4A adds signal-driven graceful shutdown, bounded JSONL logging, operational metrics, configurable limits and stricter configuration/path validation. This remains an incremental implementation, without production security certification. See [operational notes](docs/production-hardening.md) and [validation results](docs/phase4a-validation.md).
+ZigGate is an Apache-2.0 HTTP/1.1 server and reverse proxy written in **Zig 0.15.2**, targeting Linux x86_64 and aarch64. Phase 4B adds opt-in inbound TLS 1.2/1.3 through OpenSSL 3.x, exact SNI certificate selection and TLS-aware graceful shutdown, retaining Phase 4A operational safeguards. This remains an incremental implementation, without production security certification. See [TLS setup](docs/tls.md), [Phase 4B validation](docs/phase4b-validation.md), and [operational notes](docs/production-hardening.md).
 
 ## Build and run
 
-Install Zig **0.15.2 exactly**. No third-party libraries or libc are required. Integration tests use Python 3 and Linux loopback networking.
+Install Zig **0.15.2 exactly**. OpenSSL 3.x development headers/libraries and libc are required (`sudo dnf install openssl-devel openssl pkgconf-pkg-config` on Fedora). Integration tests use Python 3 and Linux loopback networking.
 
 ```sh
 zig build
@@ -14,6 +14,10 @@ zig build run
   --proxy /api/=127.0.0.1:8081 \
   --proxy /users/=127.0.0.1:8082
 ./zig-out/bin/ziggate --help
+# Opt-in HTTPS alongside HTTP (certificate instructions: docs/tls.md):
+./zig-out/bin/ziggate --tls-listen 127.0.0.1:8443 \
+  --tls-cert ./certs/server.crt --tls-key ./certs/server.key \
+  --proxy /home=127.0.0.1:3000
 ```
 
 The backends must serve HTTP/1.1 with Content-Length or connection-close framing. For a complete local test with mock backends, run `zig build integration` or the dedicated proxy test below.
@@ -36,7 +40,7 @@ Selection order is: exact internal path first, then the longest matching configu
 
 On configured proxy paths, the existing parser accepts known HTTP methods with no body; CONNECT and explicit Upgrade requests receive 501. On local paths, existing method restrictions remain. Both the backend connection and the client connection close after a proxied response. Sequential keep-alive remains available for local requests; a local persistent connection may subsequently send one proxied request, which closes after its response. There is no upstream pooling or retry.
 
-The backend Host is always the configured numeric `IPv4:port` authority. Incoming Host is validated and replaced. Client `Forwarded`, `X-Real-IP`, and all `X-Forwarded-*` headers are removed. ZigGate sets `X-Forwarded-For` to the actual socket peer's IPv4 address and `X-Forwarded-Proto: http`. There is no trusted-forwarder override in this phase.
+The backend Host is always the configured numeric `IPv4:port` authority. Incoming Host is validated and replaced. Client `Forwarded`, `X-Real-IP`, and all `X-Forwarded-*` headers are removed. ZigGate sets `X-Forwarded-For` to the actual socket peer's IPv4 address and `X-Forwarded-Proto` to `http` or `https` from the inbound transport. Backends remain plaintext HTTP. There is no trusted-forwarder override in this phase.
 
 Fixed hop-by-hop headers and all headers nominated by any Connection token list are removed in both directions. Connection lists are validated case-insensitively across repeated fields; attempts to nominate Host, Content-Length, or Transfer-Encoding are rejected rather than concealing framing. Other end-to-end fields, including repeated Set-Cookie fields and Content-Encoding, are preserved. Upstream requests explicitly carry `Content-Length: 0` and `Connection: close`.
 
@@ -46,6 +50,10 @@ Configuration uses CLI arguments; there is no JSON configuration or hot reload i
 
 | Option | Default | Accepted range / meaning |
 | --- | --- | --- |
+| `--tls-listen` | absent | Explicit HTTPS IPv4:port; requires certificate and key |
+| `--tls-cert`, `--tls-key` | absent | PEM chain and matching unencrypted key |
+| `--tls-sni` | absent | Up to 8 exact additional hostname=cert,key entries |
+| `--tls-handshake-ms` | `5000` | 1–60000; absolute TLS handshake deadline |
 | `--shutdown-ms` | `10000` | 1–60000; absolute graceful shutdown deadline |
 | `--request-ms` | `60000` | 1–60000; total active request duration |
 | `--header-bytes` | `8192` | 1–8192; inclusive request-header cap |
@@ -91,7 +99,9 @@ zig build
 zig build test --summary all
 zig build integration
 zig build -Doptimize=ReleaseSafe
-zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
+# Cross-linking TLS also requires a complete target OpenSSL prefix/sysroot:
+zig build -Dtarget=aarch64-linux-gnu.2.38 -Doptimize=ReleaseSafe \
+  -Dopenssl-prefix=/path/to/aarch64/usr
 ```
 
 Existing Phase 1/2 tests are preserved. Proxy unit tests cover route validation/precedence, internal routing, metadata sanitization, Connection nominations, malicious upstream syntax/framing, inclusive upstream header boundaries, short writes, fragmented reads, EAGAIN, failed connect completion, staged/total deadlines, and a 1 MiB body processed through fixed chunks.
@@ -102,7 +112,7 @@ The proxy fixture explicitly uses a 256-connection listen backlog. Inspection of
 
 Separate slow/late upstream cases remain. An event-gated slow request proves the backend has received the request before testing read timeout and progress by local/fast proxy clients. A Linux backlog-zero listener with a filled accept queue and a verified pending probe isolates connect timeout: it uses a 100 ms connect deadline and a distinct 3-second read deadline, then repeats timeouts while checking descriptors. This fixture fails explicitly if the kernel does not provide the required pending-connect condition. Client disconnects now happen after forwarding starts; descriptor accounting includes repeated successful requests as well as malformed/refused requests. These live checks were executed with the loopback permissions required by this environment.
 
-Phase 4A verification includes all existing suites and new signal, streaming drain, deadline, high concurrency shutdown, slow logging, redaction and configuration checks. See the [validation record](docs/phase4a-validation.md) for actual commands and results.
+Phase 4B verification adds TLS version/SNI/chain, encrypted framing, partial-write and TLS shutdown tests to the existing suites. See the [TLS validation record](docs/phase4b-validation.md). Phase 4A verification includes all existing suites and new signal, streaming drain, deadline, high concurrency shutdown, slow logging, redaction and configuration checks. See the [validation record](docs/phase4a-validation.md) for actual commands and results.
 
 Individual scripts accept a binary path:
 
@@ -118,6 +128,6 @@ If the global Zig cache is restricted, prefix commands with `ZIG_GLOBAL_CACHE_DI
 
 ## Limitations and next steps
 
-No TLS, ACME, HTTP/2, HTTP/3, WebSocket tunneling, chunked response decoding, request bodies, DNS resolution, upstream pooling, retries, load balancing, active health checks, static files, virtual hosts, or JSON configuration are implemented. The single event-loop thread scans bounded slot arrays. Host validation on incoming requests remains lexical rather than complete authority validation. Upstream destinations are administrator-controlled and should be trusted to receive forwarded end-to-end request fields; client forwarding metadata is always discarded. There is no application rate limiter, security audit, or production capacity claim.
+No ACME, live certificate reload, upstream TLS, HTTP/2, HTTP/3, WebSocket tunneling, chunked response decoding, request bodies, DNS resolution, upstream pooling, retries, load balancing, active health checks, static files, virtual hosts, or JSON configuration are implemented. The single event-loop thread scans bounded slot arrays. Host validation on incoming requests remains lexical rather than complete authority validation. Upstream destinations are administrator-controlled and should be trusted to receive forwarded end-to-end request fields; client forwarding metadata is always discarded. There is no application rate limiter, security audit, or production capacity claim.
 
-Next: broaden load/security testing and resource-exhaustion experiments. Phase 4B should design nonblocking TLS transport, certificate lifecycle and handshake limits. See [architecture](docs/architecture.md) for ownership and state transitions.
+Next: broaden load/security testing and resource-exhaustion experiments. Phase 5 should validate TLS runtime behavior on aarch64, run longer load/soak tests, and add handshake admission controls before expanding certificate or proxy features. See [architecture](docs/architecture.md) for ownership and state transitions.

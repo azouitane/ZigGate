@@ -8,6 +8,7 @@ const response = @import("../http/response.zig");
 const Upstream = @import("../proxy/upstream_connection.zig").Upstream;
 const upstream_bit: u64 = 1 << 31;
 const signal_token = std.math.maxInt(u64) - 1;
+const tls_listener_token = std.math.maxInt(u64) - 2;
 const listener_token = std.math.maxInt(u64);
 
 fn register(epfd: i32, op: u32, fd: i32, events: u32, token: u64) !void {
@@ -18,7 +19,7 @@ fn tokenFor(c: *const Connection, index: usize) u64 {
     return (@as(u64, c.generation) << 32) | @as(u64, @intCast(index));
 }
 fn interest(epfd: i32, c: *const Connection, index: usize) !void {
-    try register(epfd, E.CTL_MOD, c.fd, (if (c.state == .writing) @as(u32, E.OUT) else E.IN) | (if (c.peer_eof) @as(u32, 0) else E.RDHUP), tokenFor(c, index));
+    try register(epfd, E.CTL_MOD, c.fd, c.tls.events(if (c.state == .writing) @as(u32, E.OUT) else E.IN) | (if (c.peer_eof) @as(u32, 0) else E.RDHUP), tokenFor(c, index));
 }
 fn release(epfd: i32, c: *Connection, upstreams: []Upstream) void {
     if (c.upstream) |index| {
@@ -26,12 +27,13 @@ fn release(epfd: i32, c: *Connection, upstreams: []Upstream) void {
         c.upstream = null;
     }
     p.epoll_ctl(epfd, E.CTL_DEL, c.fd, null) catch {};
+    c.tls.deinit();
     p.close(c.fd);
     c.fd = -1;
 }
 
 fn proxyInterest(epfd: i32, c: *Connection, u: *Upstream, index: usize) !void {
-    const client_events: u32 = (if (u.pending().len != 0) @as(u32, E.OUT) else 0) | (if (c.peer_eof) @as(u32, 0) else E.RDHUP);
+    const client_events: u32 = c.tls.events(if (u.pending().len != 0) @as(u32, E.OUT) else 0) | (if (c.peer_eof) @as(u32, 0) else E.RDHUP);
     try register(epfd, E.CTL_MOD, c.fd, client_events, tokenFor(c, index));
     if (u.state == .done) {
         u.closeSocket(epfd);
@@ -49,6 +51,10 @@ fn proxyInterest(epfd: i32, c: *Connection, u: *Upstream, index: usize) !void {
     }
 }
 fn proxyFailure(epfd: i32, c: *Connection, u: *Upstream, status: u16, now: u64, options: Options, index: usize) !bool {
+    if (c.tls.write_retry or (c.tls.ssl != null and c.tls.want == .write)) {
+        c.tls.failed = true;
+        return false;
+    }
     const committed = u.committed;
     c.bytes_sent = u.bytes_sent;
     c.status = if (committed) u.status else status;
@@ -62,6 +68,35 @@ fn proxyFailure(epfd: i32, c: *Connection, u: *Upstream, status: u16, now: u64, 
 
 fn retire(epfd: i32, c: *Connection, upstreams: []Upstream, metrics: *@import("../observability/metrics.zig").Metrics, logger: *@import("../observability/logger.zig").Logger, now: u64, options: Options) void {
     observe(c, upstreams, metrics, logger, now, options);
+    if (c.state == .tls_handshake) {
+        metrics.tls_handshake_failures +|= 1;
+        if (now >= c.deadline) metrics.tls_handshake_timeouts +|= 1;
+        logger.event(.warn, "tls_handshake_failed", .{ .timeout = now >= c.deadline });
+    }
+    if (c.tls.ssl != null and c.tls.established and !c.tls.failed and !c.tls.write_retry) {
+        if (c.state == .tls_shutdown and now >= c.deadline) {
+            metrics.tls_shutdown_failures +|= 1;
+        } else {
+            const done = c.tls.shutdown() catch |err| blk: {
+                if (err == error.WouldBlock) break :blk false;
+                metrics.tls_shutdown_failures +|= 1;
+                break :blk true;
+            };
+            if (!done) {
+                if (c.upstream) |i| {
+                    upstreams[i].deinit(epfd);
+                    c.upstream = null;
+                }
+                if (c.state != .tls_shutdown) c.deadline = now + 1000;
+                c.state = .tls_shutdown;
+                // Caller-independent token uses the connection's assigned slot index.
+                interest(epfd, c, c.slot) catch {
+                    release(epfd, c, upstreams);
+                };
+                return;
+            }
+        }
+    }
     release(epfd, c, upstreams);
 }
 
@@ -83,10 +118,17 @@ fn observe(c: *Connection, upstreams: []Upstream, metrics: *@import("../observab
 
 const SocketIO = struct {
     fd: i32,
-    fn recv(self: @This(), buffer: []u8) !usize {
+    client: ?*Connection = null,
+    pub fn recv(self: @This(), buffer: []u8) !usize {
+        if (self.client) |client| {
+            if (client.tls.ssl != null) return client.tls.recv(buffer);
+        }
         return p.recv(self.fd, buffer, p.MSG.DONTWAIT);
     }
-    fn send(self: @This(), bytes: []const u8) !usize {
+    pub fn send(self: @This(), bytes: []const u8) !usize {
+        if (self.client) |client| {
+            if (client.tls.ssl != null) return client.tls.send(bytes);
+        }
         return p.send(self.fd, bytes, p.MSG.NOSIGNAL | p.MSG.DONTWAIT);
     }
 };
@@ -128,7 +170,9 @@ fn drive(c: *Connection, events: u32, now: u64, options: Options, io: anytype) !
     return true;
 }
 
-pub fn run(listener: i32, options: Options) !void {
+pub fn run(listener: i32, https: ?i32, options: Options, contexts: *@import("../tls/context.zig").Contexts) !void {
+    var https_open = https != null;
+    defer if (https_open) p.close(https.?);
     var listener_open = true;
     defer if (listener_open) p.close(listener);
     var shutdown = try @import("shutdown.zig").Shutdown.init();
@@ -151,16 +195,23 @@ pub fn run(listener: i32, options: Options) !void {
         c.generation = 0;
     }
     defer {
+        metrics.active_tls = 0;
         metrics.active_clients = 0;
         metrics.active_upstreams = 0;
         metrics.uptime_ms = timer.read() / std.time.ns_per_ms;
         logger.event(.info, "metrics", metrics);
     }
     defer for (slots) |*c| {
-        if (c.fd != -1) retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
+        if (c.fd != -1) {
+            observe(c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
+            release(epfd, c, upstreams);
+        }
     };
     try register(epfd, E.CTL_ADD, listener, E.IN, listener_token);
+    if (https) |fd| try register(epfd, E.CTL_ADD, fd, E.IN, tls_listener_token);
     try register(epfd, E.CTL_ADD, shutdown.fd, E.IN, signal_token);
+    var tls_paused = false;
+    var tls_retry_at: u64 = 0;
     var listener_paused = false;
     var retry_at: u64 = 0;
 
@@ -168,10 +219,14 @@ pub fn run(listener: i32, options: Options) !void {
     var next_metrics: u64 = 1000;
     while (true) {
         var now = timer.read() / std.time.ns_per_ms;
+        metrics.active_tls = 0;
         metrics.active_clients = 0;
         metrics.active_upstreams = 0;
         for (slots) |c| {
-            if (c.fd != -1) metrics.active_clients += 1;
+            if (c.fd != -1) {
+                metrics.active_clients += 1;
+                if (c.tls.ssl != null) metrics.active_tls += 1;
+            }
         }
         for (upstreams) |u| {
             if (u.active and u.fd != -1) metrics.active_upstreams += 1;
@@ -191,6 +246,10 @@ pub fn run(listener: i32, options: Options) !void {
             try register(epfd, E.CTL_ADD, listener, E.IN, listener_token);
             listener_paused = false;
         }
+        if (shutdown.state == .running and tls_paused and now >= tls_retry_at) {
+            try register(epfd, E.CTL_ADD, https.?, E.IN, tls_listener_token);
+            tls_paused = false;
+        }
         var wait_ms: u64 = 50;
         // Check deadlines before processing readiness, including continuously ready sockets.
         for (slots, 0..) |*c, index| {
@@ -198,16 +257,16 @@ pub fn run(listener: i32, options: Options) !void {
             if (shutdown.state != .running) {
                 c.draining = true;
                 c.close = true;
-                if (c.state == .idle or (c.state == .reading and c.used == 0)) {
+                if (c.state == .tls_handshake or c.state == .idle or (c.state == .reading and c.used == 0)) {
                     retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                     continue;
                 }
             }
-            if (c.state != .idle and now >= c.started + options.request_ms) {
+            if (c.state != .idle and c.state != .tls_handshake and c.state != .tls_shutdown and now >= c.started + options.request_ms) {
                 retire(epfd, c, upstreams, &metrics, &logger, now, options);
                 continue;
             }
-            if (c.state != .idle) wait_ms = @min(wait_ms, c.started + options.request_ms - now);
+            if (c.state != .idle and c.state != .tls_handshake and c.state != .tls_shutdown) wait_ms = @min(wait_ms, c.started + options.request_ms - now);
             if (c.state == .proxy) {
                 const u = &upstreams[c.upstream.?];
                 if (u.expired(now)) {
@@ -224,7 +283,7 @@ pub fn run(listener: i32, options: Options) !void {
                 }
             }
             if (c.expired(now)) {
-                if (c.state == .reading) {
+                if (c.state == .reading and !(c.tls.ssl != null and c.tls.want == .write)) {
                     c.respond(response.failure(408), std.mem.startsWith(u8, c.input[0..c.used], "HEAD "), true, now, options) catch {
                         retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                         continue;
@@ -242,9 +301,17 @@ pub fn run(listener: i32, options: Options) !void {
         }
         if (shutdown.state == .draining) wait_ms = @min(wait_ms, shutdown.deadline - now);
         // Use the raw wait so EINTR returns to deadline processing rather than restarting a full wait.
-        const rc = linux.epoll_wait(epfd, &events, events.len, @intCast(wait_ms));
+        var synthetic: usize = 0;
+        for (slots, 0..) |*client, index| {
+            if (synthetic == 64) break;
+            if (client.fd != -1 and (client.state == .reading or client.state == .idle) and client.tls.pending()) {
+                events[synthetic] = .{ .events = E.IN, .data = .{ .u64 = tokenFor(client, index) } };
+                synthetic += 1;
+            }
+        }
+        const rc = linux.epoll_wait(epfd, events[synthetic..].ptr, @intCast(events.len - synthetic), if (synthetic > 0) 0 else @intCast(wait_ms));
         const count: usize = switch (p.errno(rc)) {
-            .SUCCESS => rc,
+            .SUCCESS => rc + synthetic,
             .INTR => continue,
             else => return error.EpollWaitFailed,
         };
@@ -263,6 +330,11 @@ pub fn run(listener: i32, options: Options) !void {
                     listener_paused = true;
                     p.close(listener);
                     listener_open = false;
+                    if (https_open) {
+                        if (!tls_paused) try p.epoll_ctl(epfd, E.CTL_DEL, https.?, null);
+                        p.close(https.?);
+                        https_open = false;
+                    }
                     logger.event(.info, "shutdown_begin", .{ .grace_ms = options.shutdown_ms });
                 }
             }
@@ -270,21 +342,28 @@ pub fn run(listener: i32, options: Options) !void {
         if (shutdown.state == .forced) continue;
         for (events[0..count]) |event| {
             if (event.data.u64 == signal_token) continue;
-            if (event.data.u64 == listener_token) {
-                if (listener_paused or shutdown.state != .running) continue;
+            if (event.data.u64 == listener_token or event.data.u64 == tls_listener_token) {
+                const secure = event.data.u64 == tls_listener_token;
+                if ((if (secure) tls_paused else listener_paused) or shutdown.state != .running) continue;
+                const accept_fd = if (secure) https.? else listener;
                 // Bound accept work per batch so a connection flood cannot starve existing clients.
                 for (0..64) |_| {
                     var peer: std.net.Address = undefined;
                     var peer_len: p.socklen_t = @sizeOf(std.net.Address);
-                    const fd = p.accept(listener, &peer.any, &peer_len, p.SOCK.NONBLOCK | p.SOCK.CLOEXEC) catch |err| switch (err) {
+                    const fd = p.accept(accept_fd, &peer.any, &peer_len, p.SOCK.NONBLOCK | p.SOCK.CLOEXEC) catch |err| switch (err) {
                         error.WouldBlock => break,
                         error.ConnectionAborted => continue,
                         else => {
                             // Quota/resource failure: stop listener readiness spin and retry later.
                             logger.event(.warn, "accept_failure", .{});
-                            try p.epoll_ctl(epfd, E.CTL_DEL, listener, null);
-                            listener_paused = true;
-                            retry_at = now + 100;
+                            try p.epoll_ctl(epfd, E.CTL_DEL, accept_fd, null);
+                            if (secure) {
+                                tls_paused = true;
+                                tls_retry_at = now + 100;
+                            } else {
+                                listener_paused = true;
+                                retry_at = now + 100;
+                            }
                             break;
                         },
                     };
@@ -303,10 +382,19 @@ pub fn run(listener: i32, options: Options) !void {
                     };
                     const c = &slots[index];
                     const generation = c.generation +% 1;
-                    c.* = .{ .fd = fd, .generation = generation, .started = now, .deadline = now + options.timeout_ms, .peer_ip = @bitCast(peer.in.sa.addr) };
+                    c.* = .{ .slot = index, .fd = fd, .generation = generation, .started = now, .deadline = now + options.timeout_ms, .peer_ip = @bitCast(peer.in.sa.addr) };
+                    if (secure) {
+                        c.tls = @import("../tls/session.zig").Session.init(contexts.default.?, fd) catch {
+                            metrics.tls_handshake_failures +|= 1;
+                            release(epfd, c, upstreams);
+                            continue;
+                        };
+                        c.state = .tls_handshake;
+                        c.deadline = now + options.tls.handshake_ms;
+                        logger.event(.debug, "tls_accepted", .{});
+                    }
                     register(epfd, E.CTL_ADD, fd, E.IN | (if (c.peer_eof) @as(u32, 0) else E.RDHUP), tokenFor(c, index)) catch {
-                        p.close(fd);
-                        c.fd = -1;
+                        release(epfd, c, upstreams);
                     };
                 }
                 continue;
@@ -317,7 +405,32 @@ pub fn run(listener: i32, options: Options) !void {
             if (index >= slots.len) continue;
             const c = &slots[index];
             if (c.fd == -1 or tokenFor(c, index) != client_token) continue;
-            if (c.state != .idle and now >= c.started + options.request_ms) {
+            if (c.state != .idle and c.state != .tls_handshake and c.state != .tls_shutdown and now >= c.started + options.request_ms) {
+                retire(epfd, c, upstreams, &metrics, &logger, now, options);
+                continue;
+            }
+            if (c.state == .tls_handshake) {
+                if (c.expired(now)) {
+                    retire(epfd, c, upstreams, &metrics, &logger, now, options);
+                    continue;
+                }
+                c.tls.handshake() catch |err| {
+                    if (err == error.WouldBlock) {
+                        interest(epfd, c, index) catch {
+                            retire(epfd, c, upstreams, &metrics, &logger, now, options);
+                        };
+                    } else retire(epfd, c, upstreams, &metrics, &logger, now, options);
+                    continue;
+                };
+                metrics.tls_handshake_successes +|= 1;
+                if (c.tls.version() == 0x0303) metrics.tls_1_2 +|= 1;
+                if (c.tls.version() == 0x0304) metrics.tls_1_3 +|= 1;
+                logger.event(.info, "tls_handshake", .{ .duration_ms = now - c.started, .version = c.tls.version() });
+                c.state = .reading;
+                c.started = now;
+                c.deadline = now + options.timeout_ms;
+            }
+            if (c.state == .tls_shutdown) {
                 retire(epfd, c, upstreams, &metrics, &logger, now, options);
                 continue;
             }
@@ -343,7 +456,7 @@ pub fn run(listener: i32, options: Options) !void {
                     continue;
                 }
                 if (c.state == .proxy) {
-                    alive = u.flushClient(c.fd, now, options.proxy_limits) catch false;
+                    alive = u.flushIO(now, options.proxy_limits, SocketIO{ .fd = c.fd, .client = c }) catch false;
                     if (!alive) {
                         retire(epfd, c, upstreams, &metrics, &logger, timer.read() / std.time.ns_per_ms, options);
                         continue;
@@ -358,7 +471,7 @@ pub fn run(listener: i32, options: Options) !void {
             if (is_upstream) continue;
             // Readiness returned at the deadline must not extend an expired operation.
             if (c.expired(now)) continue;
-            if (shutdown.state != .running and (c.state == .idle or (c.state == .reading and c.used == 0))) {
+            if (shutdown.state != .running and (c.state == .tls_handshake or c.state == .idle or (c.state == .reading and c.used == 0))) {
                 retire(epfd, c, upstreams, &metrics, &logger, now, options);
                 continue;
             }
@@ -370,7 +483,7 @@ pub fn run(listener: i32, options: Options) !void {
             const previous_requests = c.requests;
             const previous_used = c.used;
             if (previous_state == .idle) c.started = now;
-            const alive = drive(c, event.events, now, options, SocketIO{ .fd = c.fd }) catch false;
+            const alive = drive(c, event.events, now, options, SocketIO{ .fd = c.fd, .client = c }) catch false;
             if (previous_used == 0 and c.used != 0) logger.event(.debug, "request_started", .{});
             if (c.requests != previous_requests or (c.status != 0 and previous_state == .reading)) metrics.requests +|= 1;
             if (c.state == .idle and previous_state != .idle) observe(c, upstreams, &metrics, &logger, now, options);
@@ -390,7 +503,7 @@ pub fn run(listener: i32, options: Options) !void {
                     c.upstream = i;
                     const u = &upstreams[i];
                     const end = std.mem.indexOf(u8, c.input[0..c.used], "\r\n\r\n").? + 4;
-                    u.start(c.input[0..end], options.proxy.routes[c.proxy_route], c.peer_ip, options.proxy_limits, now) catch |err| {
+                    u.startSecure(c.input[0..end], options.proxy.routes[c.proxy_route], c.peer_ip, options.proxy_limits, now, c.tls.ssl != null) catch |err| {
                         metrics.proxy_failures +|= 1;
                         logger.event(.warn, "proxy_failure", .{ .upstream = options.proxy.routes[c.proxy_route].authority });
                         const status: u16 = switch (err) {

@@ -58,8 +58,11 @@ pub const Upstream = struct {
         self.active = false;
     }
     pub fn start(self: *Upstream, raw: []const u8, route: config.Route, peer: [4]u8, limits: config.Limits, now: u64) !void {
+        return self.startSecure(raw, route, peer, limits, now, false);
+    }
+    pub fn startSecure(self: *Upstream, raw: []const u8, route: config.Route, peer: [4]u8, limits: config.Limits, now: u64, secure: bool) !void {
         self.* = .{ .active = true, .head = std.mem.startsWith(u8, raw, "HEAD "), .deadline = now + limits.connect_ms, .total_deadline = now + limits.total_ms };
-        self.request_len = (try protocol.request(raw, route, peer, &self.request)).len;
+        self.request_len = (try protocol.requestScheme(raw, route, peer, &self.request, secure)).len;
         const fd = try p.socket(p.AF.INET, p.SOCK.STREAM | p.SOCK.NONBLOCK | p.SOCK.CLOEXEC, p.IPPROTO.TCP);
         errdefer p.close(fd);
         p.connect(fd, &route.address.any, route.address.getOsSockLen()) catch |err| switch (err) {
@@ -166,7 +169,7 @@ pub const Upstream = struct {
     pub fn flushClient(self: *Upstream, client_fd: i32, now: u64, limits: config.Limits) !bool {
         return self.flushIO(now, limits, SocketIO{ .fd = client_fd });
     }
-    fn flushIO(self: *Upstream, now: u64, limits: config.Limits, io: anytype) !bool {
+    pub fn flushIO(self: *Upstream, now: u64, limits: config.Limits, io: anytype) !bool {
         if (self.pending().len == 0) return self.state != .done;
         const n = io.send(self.pending()) catch |err| switch (err) {
             error.WouldBlock => return true,

@@ -1,4 +1,4 @@
-# Architecture through Phase 4A
+# Architecture through Phase 4B
 
 ZigGate retains its single-threaded, level-triggered Linux epoll engine. `core/server.zig` creates the listener and transfers ownership to the event loop; `core/event_loop.zig` owns client slots, upstream transaction slots, descriptor registration, event dispatch, and deadline scheduling. Listener and accepted sockets are explicitly NONBLOCK/CLOEXEC. `posix.connect` is used only with nonblocking numeric IPv4 upstream sockets. No resolver or blocking network operation runs in the event loop.
 
@@ -79,3 +79,9 @@ Slow-response/fairness tests gate a handler after it has received the full reque
 `core/shutdown.zig` owns the blocked signal mask, signalfd, explicit shutdown state and grace deadline. The event loop registers its reserved token and processes signals before accepts. Idle clients close during draining; active operations retain normal deadlines and close after completion. A second delivered signal or grace expiry forces cleanup.
 
 `observability/logger.zig` serializes fixed-size JSONL records to a separately opened nonblocking stderr pipe; unsupported sinks and full pipes drop records with no queue. `observability/metrics.zig` holds saturating numeric counters without locks or allocation. The loop records request observations before freeing their resources and emits periodic/final snapshots. The CLI validates new bounds and offers a validation-only mode. No HTTP metrics endpoint or new configuration format is introduced.
+
+## Phase 4B TLS transport
+
+`tls/config.zig` validates an explicit IPv4 HTTPS listener, a required default certificate/key pair, an absolute handshake budget and at most eight exact SNI names. `tls/context.zig` owns stable-address callback state and all OpenSSL contexts, loaded before listeners open. `tls/openssl_shim.c` centralizes OpenSSL macro policy behind Zig C interoperability. `tls/session.zig` owns each client's SSL object, nonblocking handshake/read/write/shutdown operations and readiness direction. HTTP parsing and response serialization remain independent of TLS.
+
+The event loop owns both listeners and shares client/upstream pools between them. HTTPS accepts enter `tls_handshake`, reach HTTP states only on handshake success, and may enter bounded `tls_shutdown` before resource release. WANT_READ/WANT_WRITE overrides HTTP epoll interests; pending decrypted bytes receive bounded synthetic events while polling the rest of epoll. Existing upstream output buffers are passed through the same client transport and never modified across an OpenSSL write retry. Transport-derived forwarding metadata describes the inbound HTTPS scheme while upstream sockets remain plaintext. Forced cleanup bypasses queued close states and frees every SSL before its fd, then contexts after the loop. Certificate reload is restart-only. See [TLS lifecycle and security boundaries](tls.md).

@@ -1,7 +1,7 @@
 const std = @import("std");
 const proxy = @import("../proxy/proxy_config.zig");
-pub const usage = "Usage: ziggate [--bind IPv4] [--port 1..65535] [--timeout-ms 1..60000] [--idle-timeout-ms 1..60000] [--max-connections 1..32768] [--max-requests 1..65535] [--proxy /prefix/=IPv4:port] [--max-upstreams N] [--upstream-connect-ms N] [--upstream-read-ms N] [--upstream-write-ms N] [--proxy-total-ms N] [--upstream-header-bytes N] [--request-ms 1..60000] [--pending-output-bytes 1024..16384] [--header-bytes 1..8192] [--shutdown-ms 1..60000] [--log-level debug|info|warn|error] [--check-config] [--help]\n";
-pub const Options = struct { bind: []const u8 = "127.0.0.1", port: u16 = 8080, timeout_ms: u16 = 2000, idle_timeout_ms: u16 = 5000, max_connections: u16 = 1024, max_requests: u16 = 100, proxy: proxy.Config = .{}, proxy_limits: proxy.Limits = .{}, check_config: bool = false, shutdown_ms: u16 = 10000, request_ms: u16 = 60000, header_bytes: u16 = 8192, log_level: @import("../observability/logger.zig").Level = .info, help: bool = false };
+pub const usage = "Usage: ziggate [--bind IPv4] [--port 1..65535] [--timeout-ms 1..60000] [--idle-timeout-ms 1..60000] [--max-connections 1..32768] [--max-requests 1..65535] [--proxy /prefix/=IPv4:port] [--max-upstreams N] [--upstream-connect-ms N] [--upstream-read-ms N] [--upstream-write-ms N] [--proxy-total-ms N] [--upstream-header-bytes N] [--request-ms 1..60000] [--pending-output-bytes 1024..16384] [--header-bytes 1..8192] [--shutdown-ms 1..60000] [--log-level debug|info|warn|error] [--check-config] [--tls-listen IPv4:port --tls-cert PEM --tls-key PEM] [--tls-sni hostname=cert,key] [--tls-handshake-ms 1..60000] [--help]\n";
+pub const Options = struct { bind: []const u8 = "127.0.0.1", port: u16 = 8080, timeout_ms: u16 = 2000, idle_timeout_ms: u16 = 5000, max_connections: u16 = 1024, max_requests: u16 = 100, proxy: proxy.Config = .{}, proxy_limits: proxy.Limits = .{}, check_config: bool = false, shutdown_ms: u16 = 10000, request_ms: u16 = 60000, header_bytes: u16 = 8192, log_level: @import("../observability/logger.zig").Level = .info, tls: @import("../tls/config.zig").Config = .{}, help: bool = false };
 fn decimal(comptime T: type, text: []const u8) !T {
     if (text.len == 0) return error.InvalidNumber;
     for (text) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidNumber;
@@ -68,9 +68,25 @@ pub fn parse(args: []const []const u8) !Options {
             options.request_ms = value;
         } else if (std.mem.eql(u8, arg, "--log-level")) {
             options.log_level = std.meta.stringToEnum(@import("../observability/logger.zig").Level, if (std.mem.eql(u8, args[i], "error")) "err" else args[i]) orelse return error.InvalidLogLevel;
+        } else if (std.mem.eql(u8, arg, "--tls-listen")) {
+            options.tls.listen = try @import("../tls/config.zig").address(args[i]);
+        } else if (std.mem.eql(u8, arg, "--tls-cert")) {
+            options.tls.cert = args[i];
+        } else if (std.mem.eql(u8, arg, "--tls-key")) {
+            options.tls.key = args[i];
+        } else if (std.mem.eql(u8, arg, "--tls-sni")) {
+            try options.tls.add(args[i]);
+        } else if (std.mem.eql(u8, arg, "--tls-handshake-ms")) {
+            const value = try decimal(u16, args[i]);
+            if (value == 0 or value > 60000) return error.InvalidTimeout;
+            options.tls.handshake_ms = value;
         } else return error.UnknownOption;
     }
-    _ = try std.net.Address.parseIp4(options.bind, options.port);
+    const http_address = try std.net.Address.parseIp4(options.bind, options.port);
+    if (options.tls.listen) |tls_address| {
+        if (tls_address.getPort() == options.port and (http_address.in.sa.addr == 0 or tls_address.in.sa.addr == 0 or http_address.in.sa.addr == tls_address.in.sa.addr)) return error.ConflictingListeners;
+    }
+    try options.tls.validate();
     return options;
 }
 test "CLI defaults and validation" {
@@ -115,4 +131,11 @@ test "hardening CLI bounds and validation-only mode" {
     try std.testing.expectError(error.InvalidLimit, parse(&.{ "--header-bytes", "8193" }));
     try std.testing.expectError(error.InvalidLimit, parse(&.{ "--pending-output-bytes", "16385" }));
     try std.testing.expectError(error.InvalidTimeout, parse(&.{ "--request-ms", "0" }));
+}
+
+test "TLS CLI rejects incomplete or overlapping listener configuration" {
+    try std.testing.expectError(error.IncompleteTlsConfiguration, parse(&.{ "--tls-cert", "cert" }));
+    try std.testing.expectError(error.ConflictingListeners, parse(&.{ "--tls-listen", "127.0.0.1:8080", "--tls-cert", "cert", "--tls-key", "key" }));
+    const options = try parse(&.{ "--tls-listen", "127.0.0.1:8443", "--tls-cert", "cert", "--tls-key", "key", "--tls-handshake-ms", "1000" });
+    try std.testing.expectEqual(@as(u16, 1000), options.tls.handshake_ms);
 }

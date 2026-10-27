@@ -1,5 +1,7 @@
 # Phase 4A operational notes
 
+These notes describe the Phase 4A baseline. See [TLS/HTTPS](tls.md) for Phase 4B transport additions.
+
 This phase adds operational safeguards; passing tests and a short loopback workload do not establish production readiness.
 
 ## Shutdown and ownership
