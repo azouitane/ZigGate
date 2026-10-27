@@ -1,0 +1,21 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const cli = @import("cli/commands.zig");
+pub fn main() !void {
+    if (comptime builtin.zig_version.order(.{ .major = 0, .minor = 15, .patch = 2 }) != .eq)
+        @compileError("ZigGate requires Zig 0.15.2 exactly");
+    const args = try std.process.argsAlloc(std.heap.page_allocator);
+    defer std.process.argsFree(std.heap.page_allocator, args);
+    const options = cli.parse(args[1..]) catch |err| {
+        std.debug.print("ziggate: {s}\n{s}", .{ @errorName(err), cli.usage });
+        std.process.exit(2);
+    };
+    if (options.help) {
+        std.debug.print("{s}", .{cli.usage});
+        return;
+    }
+    try @import("core/server.zig").run(options);
+}
+test {
+    std.testing.refAllDeclsRecursive(@This());
+}
