@@ -14,6 +14,7 @@ pub const Generation = struct {
         self.* = .{ .config = config };
         errdefer self.deinit();
         if (config.listen == null) return;
+        if (config.cert == null or config.key == null) return error.TlsCertificateUnavailable;
         self.default = try load(config.cert.?, config.key.?);
         for (config.hosts[0..config.count], 0..) |entry, i| self.hosts[i] = try load(entry.cert, entry.key);
         c.zg_tls_sni(self.default, sni, self);
@@ -95,14 +96,18 @@ pub const Contexts = struct {
         return &self.generations[self.current];
     }
     pub fn reload(self: *Contexts) !void {
-        if (self.config.listen == null) return error.TlsNotEnabled;
+        return self.reloadWith(self.config);
+    }
+    pub fn reloadWith(self: *Contexts, config: Config) !void {
+        if (config.listen == null) return error.TlsNotEnabled;
         const next = self.current ^ 1;
         const candidate = &self.generations[next];
         if (candidate.references != 0) return error.TlsReloadBusy;
         candidate.deinit();
-        try candidate.init(self.config);
+        try candidate.init(config);
         const previous = self.active();
         self.current = next;
+        self.config = config;
         previous.retired = true;
         if (previous.references == 0) previous.deinit();
     }

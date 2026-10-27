@@ -18,6 +18,9 @@ pub fn build(b: *std.Build) void {
         exe.root_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
         exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib64" }) });
     }
+    exe.root_module.addIncludePath(b.path("src/acme"));
+    exe.root_module.addCSourceFile(.{ .file = b.path("src/acme/shim.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    exe.root_module.linkSystemLibrary("dl", .{});
     b.installArtifact(exe);
     const run = b.addRunArtifact(exe);
     if (b.args) |args| run.addArgs(args);
@@ -48,7 +51,11 @@ pub fn build(b: *std.Build) void {
     const reliability = b.addSystemCommand(&.{ "python3", "tests/integration/tls_reliability_test.py" });
     reliability.addArtifactArg(exe);
     b.step("tls-reliability", "Run TLS admission and reload regressions").dependOn(&reliability.step);
+    const acme = b.addSystemCommand(&.{ "python3", "tests/integration/acme_test.py" });
+    acme.addArtifactArg(exe);
+    b.step("acme-integration", "Run offline HTTPS ACME issuance/renewal regressions").dependOn(&acme.step);
     const integration_step = b.step("integration", "Run socket integration tests (Python 3)");
+    integration_step.dependOn(&acme.step);
     integration_step.dependOn(&reliability.step);
     integration_step.dependOn(&tls_tests.step);
     integration_step.dependOn(&hardening.step);

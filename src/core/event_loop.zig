@@ -179,13 +179,15 @@ fn drive(c: *Connection, events: u32, now: u64, options: Options, io: anytype) !
     return true;
 }
 
-pub fn run(listener: i32, https: ?i32, options: Options, contexts: *@import("../tls/context.zig").Contexts) !void {
+pub fn run(listener: i32, https: ?i32, options: Options, contexts: *@import("../tls/context.zig").Contexts, manager: ?*@import("../acme/manager.zig").Manager) !void {
     var https_open = https != null;
     defer if (https_open) p.close(https.?);
     var listener_open = true;
     defer if (listener_open) p.close(listener);
     var shutdown = try @import("shutdown.zig").Shutdown.init();
     defer shutdown.deinit();
+    if (manager) |m| try m.start();
+    defer if (manager) |m| m.stop();
     var logger = @import("../observability/logger.zig").Logger.init(options.log_level);
     defer logger.deinit();
     defer logger.event(.info, "server_stop", .{ .dropped_logs = logger.dropped });
@@ -206,6 +208,10 @@ pub fn run(listener: i32, https: ?i32, options: Options, contexts: *@import("../
         c.generation = 0;
     }
     defer {
+        if (manager) |m| {
+            m.stop();
+            m.tick(contexts, options.tls, &metrics, &logger);
+        }
         metrics.active_tls_handshakes = admission.active;
         metrics.active_tls = 0;
         metrics.active_clients = 0;
@@ -247,6 +253,7 @@ pub fn run(listener: i32, https: ?i32, options: Options, contexts: *@import("../
             if (u.active and u.fd != -1) metrics.active_upstreams += 1;
         }
         metrics.uptime_ms = now;
+        if (manager) |m| m.tick(contexts, options.tls, &metrics, &logger);
         if (now >= next_metrics) {
             logger.event(.info, "metrics", metrics);
             next_metrics = now + 1000;
@@ -346,6 +353,7 @@ pub fn run(listener: i32, https: ?i32, options: Options, contexts: *@import("../
                 }
                 const was_running = shutdown.state == .running;
                 shutdown.signal(now, options.shutdown_ms);
+                if (manager) |m| m.requestStop();
                 if (was_running) {
                     if (!listener_paused) try p.epoll_ctl(epfd, E.CTL_DEL, listener, null);
                     listener_paused = true;
@@ -431,6 +439,10 @@ pub fn run(listener: i32, https: ?i32, options: Options, contexts: *@import("../
                     const generation = c.generation +% 1;
                     c.* = .{ .slot = index, .fd = fd, .generation = generation, .started = now, .deadline = now + options.timeout_ms, .peer_ip = @bitCast(peer.in.sa.addr) };
                     if (secure) {
+                        if (contexts.active().default == null) {
+                            release(epfd, c, upstreams, &metrics);
+                            continue;
+                        }
                         c.tls = @import("../tls/session.zig").Session.init(contexts.active(), fd, &admission) catch |err| {
                             if (err == error.TlsAdmissionRejected) {
                                 metrics.tls_handshake_rejections +|= 1;

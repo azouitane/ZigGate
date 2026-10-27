@@ -1,10 +1,10 @@
 # ZigGate
 
-ZigGate is an Apache-2.0 HTTP/1.1 server and reverse proxy written in **Zig 0.15.2**, targeting Linux x86_64 and aarch64. Phase 5A adds bounded TLS handshake admission, safe SIGHUP certificate rotation, reliability/load/soak tests and emulated aarch64 runtime validation to the OpenSSL 3.x HTTPS transport. This remains an incremental implementation, without production security certification. See [TLS setup](docs/tls.md), [Phase 5A validation](docs/phase5a-validation.md), and [operational notes](docs/production-hardening.md).
+ZigGate is an Apache-2.0 HTTP/1.1 server and reverse proxy written in **Zig 0.15.2**, targeting Linux x86_64 and aarch64. Phase 5B adds explicit ACME v2 automatic HTTPS, HTTP-01, private certificate storage, renewal and safe TLS activation while retaining the hardened HTTP/proxy/TLS transport. This remains an incremental implementation, without production security certification. See [automatic HTTPS](docs/acme.md), [Phase 5B validation](docs/phase5b-validation.md), [TLS setup](docs/tls.md), and [operational notes](docs/production-hardening.md).
 
 ## Build and run
 
-Install Zig **0.15.2 exactly**. OpenSSL 3.x development headers/libraries and libc are required (`sudo dnf install openssl-devel openssl pkgconf-pkg-config` on Fedora). Integration tests use Python 3 and Linux loopback networking.
+Install Zig **0.15.2 exactly**. OpenSSL 3.x, libc and libcurl development headers are required (`sudo dnf install openssl-devel openssl libcurl-devel pkgconf-pkg-config` on Fedora). ACME runtime additionally requires OpenSSL-backed libcurl with async DNS and thread-safe initialization; HTTP/manual TLS do not load it. Integration tests use Python 3 and Linux loopback networking.
 
 ```sh
 zig build
@@ -129,9 +129,9 @@ If the global Zig cache is restricted, prefix commands with `ZIG_GLOBAL_CACHE_DI
 
 ## Limitations and next steps
 
-No ACME, upstream TLS, HTTP/2, HTTP/3, WebSocket tunneling, chunked response decoding, request bodies, DNS resolution, upstream pooling, retries, load balancing, active health checks, static files, virtual hosts, or JSON configuration are implemented. The single event-loop thread scans bounded slot arrays. Host validation on incoming requests remains lexical rather than complete authority validation. Upstream destinations are administrator-controlled and should be trusted to receive forwarded end-to-end request fields; client forwarding metadata is always discarded. There is no application rate limiter, security audit, or production capacity claim.
+No DNS-01/TLS-ALPN-01, upstream TLS, HTTP/2, HTTP/3, WebSocket tunneling, chunked response decoding, request bodies, DNS resolution, upstream pooling, retries, load balancing, active health checks, static files, virtual hosts, or JSON configuration are implemented. The single event-loop thread scans bounded slot arrays. Host validation on incoming requests remains lexical rather than complete authority validation. Upstream destinations are administrator-controlled and should be trusted to receive forwarded end-to-end request fields; client forwarding metadata is always discarded. There is no application rate limiter, security audit, or production capacity claim.
 
-Next: broaden load/security testing and resource-exhaustion experiments. Next steps include native aarch64 hardware tests, longer isolated soak/load runs, per-source admission policy and a worker-based reload/crypto design if latency guarantees require it. See [architecture](docs/architecture.md) for ownership and state transitions.
+Next: broaden load/security testing and resource-exhaustion experiments. Phase 6 should validate Pebble/public staging with explicit authorization and real DNS, exercise storage/crash failures and longer renewals, then review account-key rollover, revocation and expanded certificate management. Native aarch64 hardware and isolated reliability/load checks remain useful. See [architecture](docs/architecture.md) for ownership and state transitions.
 
 ## TLS admission and certificate rotation
 
@@ -148,3 +148,20 @@ python3 tools/tls_load.py ./zig-out/bin/ziggate --build-mode ReleaseSafe \
 ```
 
 Reload validates a separate generation before activation. Active sessions retain their original certificates and SNI contexts; failure preserves the last valid generation. Two generations bound history, so another rotation can return `TlsReloadBusy` until old sessions drain. Attempts are limited to one per second, with no queued retries. Regular-file sizes and chain length are bounded; synchronous filesystem/OpenSSL work can briefly stall the loop. See [TLS semantics](docs/tls.md) and [measured Phase 5A results](docs/phase5a-validation.md), including the distinction between QEMU runtime coverage and real aarch64 hardware.
+
+## Automatic HTTPS (explicit opt-in)
+
+```sh
+./zig-out/bin/ziggate --bind 0.0.0.0 --port 8080 \
+  --tls-listen 0.0.0.0:8443 \
+  --acme-enabled --acme-staging --acme-accept-terms \
+  --acme-domain example.com --acme-email admin@example.com \
+  --acme-storage /var/lib/ziggate/acme-staging \
+  --acme-issuer-ca-file /etc/ziggate/letsencrypt-staging-roots.pem \
+  --proxy /api=127.0.0.1:3000
+zig build acme-integration
+```
+
+Public HTTP-01 requires reachable port **80**, including forwarding if the local listener is 8080. Staging issuer roots require explicit, dedicated trust provisioning; browser trust is intentionally absent. Production uses the separate `--acme-production` flag and separate account storage. Manual certificate flags cannot be mixed with automatic mode. Review CA terms before passing the agreement flag.
+
+The bounded worker handles ACME network/crypto/storage operations; normal HTTP/challenges remain available while first issuance is pending, and HTTPS closes until a valid context exists. Complete validated bundles are selected atomically and activated through existing TLS generation rotation. Account keys, prior certificates and retry state persist privately outside the repository. See [architecture, security and failure recovery](docs/acme.md) and [actual test results and limitations](docs/phase5b-validation.md). Public Let's Encrypt/Pebble interoperability is not yet validated.

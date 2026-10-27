@@ -57,6 +57,15 @@ pub const Connection = struct {
             self.requests += 1;
             // Never dispatch surplus bytes as another request. Close after the first response.
             const close = self.draining or request.close or self.peer_eof or self.used != end + 4 or self.requests >= options.max_requests;
+            const acme = @import("../acme/challenge.zig");
+            if (options.challenge_store) |store| {
+                if (std.mem.startsWith(u8, request.target, acme.prefix)) {
+                    var body: [192]u8 = undefined;
+                    if (!std.mem.eql(u8, request.method, "GET") and !head) return self.respond(response.failure(405), head, true, now, options);
+                    const value = store.lookup(request.target[acme.prefix.len..], &body, acme.now()) orelse return self.respond(response.failure(404), head, close, now, options);
+                    return self.respond(.{ .status = 200, .body = value }, head, close, now, options);
+                }
+            }
             if (options.proxy.match(request.target)) |route| {
                 self.proxied = true;
                 self.proxy_route = route;
@@ -185,4 +194,27 @@ test "configured client header ceiling applies before dispatch" {
     try c.process(0, .{ .header_bytes = raw.len - 1 });
     try std.testing.expectEqual(@as(u16, 431), c.status);
     try std.testing.expect(c.close);
+}
+
+test "HTTP-01 namespace wins proxy routing without affecting other paths" {
+    var options: Options = .{};
+    var challenges: @import("../acme/challenge.zig").Store = .{};
+    options.challenge_store = &challenges;
+    try options.proxy.add("/.well-known/=127.0.0.1:9999");
+    try challenges.put("abcdefghijklmnopqrstuvwxyz", "expected-key-authorization", @import("../acme/challenge.zig").now() + 10000);
+    var c: Connection = .{};
+    const wire = "GET /.well-known/acme-challenge/abcdefghijklmnopqrstuvwxyz HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    @memcpy(c.input[0..wire.len], wire);
+    c.used = wire.len;
+    try c.process(0, options);
+    try std.testing.expectEqual(@as(u16, 200), c.status);
+    try std.testing.expect(std.mem.endsWith(u8, c.pending(), "expected-key-authorization"));
+    challenges.clear();
+    try c.process(0, options);
+    try std.testing.expectEqual(@as(u16, 404), c.status);
+    const other = "GET /.well-known/other HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    @memcpy(c.input[0..other.len], other);
+    c.used = other.len;
+    try c.process(0, options);
+    try std.testing.expectEqual(State.proxy, c.state);
 }

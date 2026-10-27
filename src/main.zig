@@ -6,7 +6,7 @@ pub fn main() !void {
         @compileError("ZigGate requires Zig 0.15.2 exactly");
     const args = try std.process.argsAlloc(std.heap.page_allocator);
     defer std.process.argsFree(std.heap.page_allocator, args);
-    const options = cli.parse(args[1..]) catch |err| {
+    var options = cli.parse(args[1..]) catch |err| {
         std.debug.print("ziggate: {s}\n{s}", .{ @errorName(err), cli.usage });
         std.process.exit(2);
     };
@@ -14,8 +14,19 @@ pub fn main() !void {
         std.debug.print("{s}", .{cli.usage});
         return;
     }
+    var acme: @import("acme/manager.zig").Manager = undefined;
+    var manager: ?*@import("acme/manager.zig").Manager = null;
+    if (options.acme.enabled) {
+        acme.init(options.acme) catch |err| {
+            std.debug.print("ziggate: {s}: check private ACME storage, state and trust configuration\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+        manager = &acme;
+        acme.configure(&options);
+    }
+    defer if (manager) |m| m.deinit();
     var contexts: @import("tls/context.zig").Contexts = .{};
-    contexts.init(options.tls) catch |err| {
+    contexts.init(if (options.acme.enabled and options.tls.cert == null) .{} else options.tls) catch |err| {
         std.debug.print("ziggate: {s}: check TLS certificate chain, unencrypted PEM key, matching key and file permissions\n", .{@errorName(err)});
         std.process.exit(2);
     };
@@ -24,7 +35,7 @@ pub fn main() !void {
         std.debug.print("configuration valid\n", .{});
         return;
     }
-    try @import("core/server.zig").run(options, &contexts);
+    try @import("core/server.zig").run(options, &contexts, manager);
 }
 test {
     std.testing.refAllDeclsRecursive(@This());

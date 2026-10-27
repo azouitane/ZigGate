@@ -1,4 +1,4 @@
-# Architecture through Phase 5A
+# Architecture through Phase 5B
 
 ZigGate retains its single-threaded, level-triggered Linux epoll engine. `core/server.zig` creates the listener and transfers ownership to the event loop; `core/event_loop.zig` owns client slots, upstream transaction slots, descriptor registration, event dispatch, and deadline scheduling. Listener and accepted sockets are explicitly NONBLOCK/CLOEXEC. `posix.connect` is used only with nonblocking numeric IPv4 upstream sockets. No resolver or blocking network operation runs in the event loop.
 
@@ -93,3 +93,9 @@ The event loop owns both listeners and shares client/upstream pools between them
 `tls/context.zig` holds two stable Generation slots. The inactive slot must have zero references before preparation; errors free partial contexts and leave the active index unchanged. Commit flips one index, retires the previous slot, and frees retired contexts when its final Session releases. The C shim parses bounded in-memory PEM data with OpenSSL and validates adjacent issuer/signatures. Regular files are opened and checked once before bounded reads, preventing pipe/device loads and pathname reopening races.
 
 The signalfd mask now includes SIGHUP. Signal work per batch and reload attempts per second are bounded, with termination taking priority over reload. Preparation is synchronous regular-file/crypto work, explicitly outside network-nonblocking guarantees. Deadline checks refresh monotonic time after preparation and before each dispatch. No worker thread, cross-thread context transfer or unbounded generation queue is added.
+
+## Phase 5B ACME worker boundary
+
+The optional ACME Manager is initialized at a stable main-thread address before listener creation. It opens private fd-relative storage and validates existing state without network IO. The event loop starts one worker after signalfd signals are blocked, so worker/resolver threads inherit the correct mask. HTTP dispatch copies published challenge bodies under a short mutex before proxy matching. Network calls, JWS/CSR generation, strict issuance validation and durable storage writes stay in the worker.
+
+A bounded publication slot transfers only a bundle index/expiration and counters to the loop. Activation calls `Contexts.reloadWith` with stable `/proc/self/fd/...` paths anchored to the retained storage fd. No OpenSSL SSL_CTX/SSL object is shared between worker crypto and event-loop transport. Three disk bundle slots preserve selected/currently served material; the two in-memory TLS generations remain unchanged. Rate limits, polling/call caps and persisted backoff prevent overlapping renewal loops. Shutdown cancels and joins the worker before its storage/shared memory is destroyed. See [ACME architecture and limits](acme.md).

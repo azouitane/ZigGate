@@ -1,6 +1,6 @@
 # TLS reliability, admission and certificate reload
 
-ZigGate terminates inbound HTTPS with OpenSSL **3.x**, then uses the same strict HTTP/1.1 parser, router, limits and plaintext HTTP upstream transport as the HTTP listener. HTTPS is opt-in. The executable links OpenSSL and libc even in HTTP-only deployments. No TLS or cryptography is implemented by ZigGate itself.
+ZigGate terminates inbound HTTPS with OpenSSL **3.x**, then uses the same strict HTTP/1.1 parser, router, limits and plaintext HTTP upstream transport as the HTTP listener. HTTPS is opt-in. Phase 5B adds a separate [automatic ACME lifecycle](acme.md); the certificate-file/SNI CLI described here is manual mode unless explicitly noted. The executable links OpenSSL and libc even in HTTP-only deployments. No TLS or cryptography is implemented by ZigGate itself.
 
 ## Dependencies and build
 
@@ -74,7 +74,7 @@ curl http://127.0.0.1:8080/health
 | `--max-tls-handshakes N` | 128 | Maximum simultaneous unfinished handshakes, 1–32768; also bounded by global client capacity |
 | `--tls-sni hostname=cert,key` | absent | Repeat for at most eight additional exact DNS names |
 
-Listener, certificate and key must be supplied together. Incomplete configurations, zero/invalid ports, overlapping HTTP/HTTPS bind endpoints, invalid PEM, missing/unreadable files, key mismatches and invalid SNI maps fail startup. All contexts load before either listener is opened. No TLS failure activates plaintext on the HTTPS port. Port 8443 avoids privileged bind requirements.
+In manual mode, listener, certificate and key must be supplied together. Automatic ACME mode instead requires an explicit listener and its own domain/account/storage configuration, and cannot be mixed with manual key or SNI flags. Incomplete configurations, zero/invalid ports, overlapping HTTP/HTTPS bind endpoints, invalid PEM, missing/unreadable files, key mismatches and invalid SNI maps fail startup. All contexts load before either listener is opened. No TLS failure activates plaintext on the HTTPS port. Port 8443 avoids privileged bind requirements.
 
 `--check-config` loads and validates every configured chain/key, including SNI entries, without opening listeners:
 
@@ -185,7 +185,7 @@ zig build -Doptimize=ReleaseSafe
 
 Tests generate development keys/certificates in temporary directories, including a real root/intermediate/leaf chain. Python SSL clients verify trusted certificates; alternate/unknown SNI certificate selection is separately checked by DER comparison. A real OpenSSL memory-BIO unit test forces partial writes, WANT retries and close_notify backpressure without TCP timing assumptions. Integration synchronization uses readiness/log events, received bytes and backend gates. See [validation record](phase4b-validation.md) for exact executed commands and results.
 
-No ACME, HTTP/2/3, QUIC, upstream TLS, OCSP stapling, mTLS, resumption, per-source/per-second handshake rate limiter or multiworker crypto isolation is included. SNI does not enforce HTTP Host consistency. Phase 5A adds measured shared-host load/soak tooling and emulated aarch64 validation; neither establishes production capacity or native aarch64 hardware coverage. See [Phase 5A results](phase5a-validation.md). Deployment requires security review beyond this test suite.
+No DNS-01/TLS-ALPN-01, HTTP/2/3, QUIC, upstream TLS, OCSP stapling, mTLS, resumption, per-source/per-second handshake rate limiter or multiworker crypto isolation is included. SNI does not enforce HTTP Host consistency. Phase 5A adds measured shared-host load/soak tooling and emulated aarch64 validation; neither establishes production capacity or native aarch64 hardware coverage. See [Phase 5A results](phase5a-validation.md). Deployment requires security review beyond this test suite.
 
 OpenSSL API references: [nonblocking I/O and error classification](https://docs.openssl.org/3.5/man3/SSL_get_error/), [write retry requirements](https://docs.openssl.org/3.3/man3/SSL_write/), [SNI callback ownership/selection](https://docs.openssl.org/3.0/man3/SSL_CTX_set_tlsext_servername_callback/), and [shutdown behavior](https://docs.openssl.org/3.5/man3/SSL_shutdown/).
 
@@ -213,3 +213,7 @@ The resilience profile covers 64 established sessions, eight incomplete handshak
 RSS/fds/CPU are sampled from the gateway's /proc entries every 100 ms; brief peaks can be missed. CPU percentages use 100% for one fully utilized core, are subject to tick quantization, and average CPU includes startup and the drain sampling window. Optional JSONL sampling writes from the test process, not the server. Client/backend threads and host activity affect all results.
 
 Soak repeats waves, waits for a fresh zero-active-client/zero-handshake metrics snapshot after every wave, and reloads every fifth round. After three warmup points, at least eight drained points and a monotonic increase greater than two fds or 8 MiB RSS trigger a suspicious-growth flag. RSS alone never establishes a leak; allocator/provider caches can retain memory. Samples use a 10000-point rolling buffer and drained histories a 1024-point rolling buffer; JSONL can retain the full trace. Output contains RPS, latency percentiles, payload throughput, handshake/reload metrics, CPU and resources. Soak pacing intentionally includes drain sampling and is not a throughput benchmark. Flags are diagnostic rather than a formal leak proof.
+
+## Automatic certificate activation
+
+[ACME mode](acme.md) manages one SAN certificate for up to eight DNS names, retains private account/certificate storage and automatically calls the same safe two-generation reload mechanism. First issuance does not create an insecure bootstrap certificate: HTTP/challenges remain available, while HTTPS connections close until a context is ready. Failed renewal preserves the current context. Busy old generations defer activation with bounded retries; persisted validated candidates survive restart. Manual SIGHUP behavior remains available, but does not bypass ACME issuance/backoff policy. TLS validation/reload still uses synchronous bounded local PEM reads, even though ACME network/crypto/storage preparation runs in a separate worker.

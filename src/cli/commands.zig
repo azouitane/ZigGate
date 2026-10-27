@@ -1,7 +1,7 @@
 const std = @import("std");
 const proxy = @import("../proxy/proxy_config.zig");
-pub const usage = "Usage: ziggate [--bind IPv4] [--port 1..65535] [--timeout-ms 1..60000] [--idle-timeout-ms 1..60000] [--max-connections 1..32768] [--max-requests 1..65535] [--proxy /prefix/=IPv4:port] [--max-upstreams N] [--upstream-connect-ms N] [--upstream-read-ms N] [--upstream-write-ms N] [--proxy-total-ms N] [--upstream-header-bytes N] [--request-ms 1..60000] [--pending-output-bytes 1024..16384] [--header-bytes 1..8192] [--shutdown-ms 1..60000] [--log-level debug|info|warn|error] [--check-config] [--tls-listen IPv4:port --tls-cert PEM --tls-key PEM] [--tls-sni hostname=cert,key] [--tls-handshake-ms 1..60000] [--max-tls-handshakes 1..32768] [--help]\n";
-pub const Options = struct { bind: []const u8 = "127.0.0.1", port: u16 = 8080, timeout_ms: u16 = 2000, idle_timeout_ms: u16 = 5000, max_connections: u16 = 1024, max_requests: u16 = 100, proxy: proxy.Config = .{}, proxy_limits: proxy.Limits = .{}, check_config: bool = false, shutdown_ms: u16 = 10000, request_ms: u16 = 60000, header_bytes: u16 = 8192, log_level: @import("../observability/logger.zig").Level = .info, tls: @import("../tls/config.zig").Config = .{}, help: bool = false };
+pub const usage = "Usage: ziggate [--bind IPv4] [--port 1..65535] [--timeout-ms 1..60000] [--idle-timeout-ms 1..60000] [--max-connections 1..32768] [--max-requests 1..65535] [--proxy /prefix/=IPv4:port] [--max-upstreams N] [--upstream-connect-ms N] [--upstream-read-ms N] [--upstream-write-ms N] [--proxy-total-ms N] [--upstream-header-bytes N] [--request-ms 1..60000] [--pending-output-bytes 1024..16384] [--header-bytes 1..8192] [--shutdown-ms 1..60000] [--log-level debug|info|warn|error] [--check-config] [--tls-listen IPv4:port --tls-cert PEM --tls-key PEM] [--tls-sni hostname=cert,key] [--tls-handshake-ms 1..60000] [--max-tls-handshakes 1..32768] [--acme-enabled --acme-domain DNS --acme-email EMAIL --acme-storage ABSOLUTE --acme-accept-terms --acme-staging|--acme-production] [--acme-directory LOOPBACK_HTTPS --acme-ca-file PEM --acme-issuer-ca-file PEM] [--help]\n";
+pub const Options = struct { bind: []const u8 = "127.0.0.1", port: u16 = 8080, timeout_ms: u16 = 2000, idle_timeout_ms: u16 = 5000, max_connections: u16 = 1024, max_requests: u16 = 100, proxy: proxy.Config = .{}, proxy_limits: proxy.Limits = .{}, check_config: bool = false, shutdown_ms: u16 = 10000, request_ms: u16 = 60000, header_bytes: u16 = 8192, log_level: @import("../observability/logger.zig").Level = .info, tls: @import("../tls/config.zig").Config = .{}, acme: @import("../acme/config.zig").Config = .{}, challenge_store: ?*@import("../acme/challenge.zig").Store = null, help: bool = false };
 fn decimal(comptime T: type, text: []const u8) !T {
     if (text.len == 0) return error.InvalidNumber;
     for (text) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidNumber;
@@ -18,6 +18,19 @@ pub fn parse(args: []const []const u8) !Options {
         }
         if (std.mem.eql(u8, arg, "--check-config")) {
             options.check_config = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--acme-enabled")) {
+            options.acme.enabled = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--acme-accept-terms")) {
+            options.acme.agree = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--acme-staging") or std.mem.eql(u8, arg, "--acme-production")) {
+            if (options.acme.environment != .unset) return error.ConflictingAcmeEnvironment;
+            options.acme.environment = if (std.mem.eql(u8, arg, "--acme-staging")) .staging else .production;
             continue;
         }
         i += 1;
@@ -84,13 +97,30 @@ pub fn parse(args: []const []const u8) !Options {
             const value = try decimal(u16, args[i]);
             if (value == 0 or value > 60000) return error.InvalidTimeout;
             options.tls.handshake_ms = value;
+        } else if (std.mem.eql(u8, arg, "--acme-domain")) {
+            try options.acme.add(args[i]);
+        } else if (std.mem.eql(u8, arg, "--acme-email")) {
+            options.acme.email = args[i];
+        } else if (std.mem.eql(u8, arg, "--acme-storage")) {
+            options.acme.storage = args[i];
+        } else if (std.mem.eql(u8, arg, "--acme-directory")) {
+            if (options.acme.environment != .unset) return error.ConflictingAcmeEnvironment;
+            options.acme.environment = .local;
+            options.acme.directory = args[i];
+        } else if (std.mem.eql(u8, arg, "--acme-ca-file")) {
+            options.acme.ca_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--acme-issuer-ca-file")) {
+            options.acme.issuer_ca = args[i];
         } else return error.UnknownOption;
     }
     const http_address = try std.net.Address.parseIp4(options.bind, options.port);
     if (options.tls.listen) |tls_address| {
         if (tls_address.getPort() == options.port and (http_address.in.sa.addr == 0 or tls_address.in.sa.addr == 0 or http_address.in.sa.addr == tls_address.in.sa.addr)) return error.ConflictingListeners;
     }
-    try options.tls.validate();
+    try options.acme.validate();
+    if (options.acme.enabled) {
+        if (options.tls.listen == null or options.tls.cert != null or options.tls.key != null or options.tls.count != 0) return error.IncompatibleAcmeTlsConfiguration;
+    } else try options.tls.validate();
     return options;
 }
 test "CLI defaults and validation" {
@@ -150,4 +180,13 @@ test "TLS admission bounds preserve handshake timeout option compatibility" {
     try std.testing.expectEqual(@as(u16, 900), options.tls.handshake_ms);
     try std.testing.expectError(error.InvalidLimit, parse(&.{ "--max-tls-handshakes", "0" }));
     try std.testing.expectError(error.InvalidLimit, parse(&.{ "--max-tls-handshakes", "32769" }));
+}
+
+test "automatic HTTPS requires explicit environment and excludes manual key inputs" {
+    try std.testing.expectError(error.AcmeRequiresExplicitEnable, parse(&.{ "--acme-domain", "example.com" }));
+    try std.testing.expectError(error.IncompleteAcmeConfiguration, parse(&.{"--acme-enabled"}));
+    try std.testing.expectError(error.ConflictingAcmeEnvironment, parse(&.{ "--acme-staging", "--acme-production" }));
+    const options = try parse(&.{ "--acme-enabled", "--acme-staging", "--acme-accept-terms", "--acme-domain", "example.com", "--acme-email", "admin@example.com", "--acme-storage", "/var/lib/ziggate/acme", "--tls-listen", "127.0.0.1:9443" });
+    try std.testing.expect(options.acme.enabled);
+    try std.testing.expect(options.tls.cert == null);
 }

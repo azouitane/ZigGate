@@ -1,5 +1,15 @@
 /// Event-loop owned, fixed-size counters. Snapshots are emitted as JSONL.
 pub const Metrics = struct {
+    acme_account_attempts: u64 = 0,
+    acme_order_successes: u64 = 0,
+    acme_order_failures: u64 = 0,
+    acme_challenge_successes: u64 = 0,
+    acme_challenge_failures: u64 = 0,
+    acme_renewal_successes: u64 = 0,
+    acme_renewal_failures: u64 = 0,
+    acme_activation_failures: u64 = 0,
+    acme_rate_limits: u64 = 0,
+    acme_days_until_expiration: i64 = -1,
     active_tls_handshakes: u64 = 0,
     tls_handshake_rejections: u64 = 0,
     tls_reload_successes: u64 = 0,
